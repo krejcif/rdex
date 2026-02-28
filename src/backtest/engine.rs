@@ -747,6 +747,385 @@ impl BacktestResult {
         println!("  TX Fees Paid:       ${:>10.2}", total_tx_fees);
         println!("  Funding Fees Paid:  ${:>10.2}", total_funding);
         println!("  Final Equity:       ${:>10.2}", self.final_equity);
+
+        // === EXTENDED REPORTING FOR STRATEGY IMPROVEMENT CONTEXT ===
+
+        // Drawdown analysis
+        if p.equity_curve.len() > 1 {
+            println!("\n  --- Drawdown Analysis ---");
+            let mut peak = p.equity_curve[0];
+            let mut max_dd_start = 0usize;
+            let mut max_dd_end = 0usize;
+            let mut current_dd_start = 0usize;
+            let mut max_dd_val = 0.0_f64;
+            let mut in_drawdown = false;
+            let mut dd_count = 0usize;
+            let mut dd_durations = Vec::new();
+            let mut current_dd_depth = 0.0_f64;
+
+            for (i, &eq) in p.equity_curve.iter().enumerate() {
+                if eq > peak {
+                    if in_drawdown {
+                        dd_durations.push(i - current_dd_start);
+                        in_drawdown = false;
+                    }
+                    peak = eq;
+                } else {
+                    let dd = (peak - eq) / peak * 100.0;
+                    if dd > 0.01 && !in_drawdown {
+                        in_drawdown = true;
+                        current_dd_start = i;
+                        dd_count += 1;
+                    }
+                    if dd > current_dd_depth {
+                        current_dd_depth = dd;
+                    }
+                    if dd > max_dd_val {
+                        max_dd_val = dd;
+                        max_dd_start = current_dd_start;
+                        max_dd_end = i;
+                    }
+                }
+            }
+            if in_drawdown {
+                dd_durations.push(p.equity_curve.len() - 1 - current_dd_start);
+            }
+
+            let max_dd_duration = max_dd_end.saturating_sub(max_dd_start);
+            let avg_dd_duration = if dd_durations.is_empty() {
+                0.0
+            } else {
+                dd_durations.iter().sum::<usize>() as f64 / dd_durations.len() as f64
+            };
+            let longest_dd = dd_durations.iter().copied().max().unwrap_or(0);
+            // Time underwater = % of candles in drawdown
+            let underwater_candles: usize = dd_durations.iter().sum();
+            let underwater_pct =
+                underwater_candles as f64 / p.equity_curve.len().max(1) as f64 * 100.0;
+
+            println!(
+                "  Max DD Duration:    {:>10} candles ({:.1} days)",
+                max_dd_duration,
+                max_dd_duration as f64 / 96.0
+            );
+            println!(
+                "  Longest Underwater: {:>10} candles ({:.1} days)",
+                longest_dd,
+                longest_dd as f64 / 96.0
+            );
+            println!(
+                "  Avg DD Duration:    {:>10.0} candles ({:.1} days)",
+                avg_dd_duration,
+                avg_dd_duration / 96.0
+            );
+            println!("  Drawdown Periods:   {:>10}", dd_count);
+            println!("  Time Underwater:    {:>9.1}%", underwater_pct);
+        }
+
+        // Confidence calibration — bucket trades by confidence and show performance
+        if !self.trades.is_empty() {
+            let conf_trades: Vec<_> = self.trades.iter().filter(|t| t.confidence > 0.0).collect();
+            if !conf_trades.is_empty() {
+                println!("\n  --- Confidence Calibration ---");
+                let buckets = [
+                    ("Low  (0.0-0.45)", 0.0, 0.45),
+                    ("Med  (0.45-0.55)", 0.45, 0.55),
+                    ("High (0.55-0.65)", 0.55, 0.65),
+                    ("VHi  (0.65-1.0)", 0.65, 1.01),
+                ];
+                println!(
+                    "  {:20} {:>5} {:>6} {:>8} {:>8} {:>6}",
+                    "Bucket", "Trd", "Win%", "AvgPnL%", "TotPnL%", "PF"
+                );
+                for (label, lo, hi) in &buckets {
+                    let bt: Vec<_> = conf_trades
+                        .iter()
+                        .filter(|t| t.confidence >= *lo && t.confidence < *hi)
+                        .collect();
+                    if bt.is_empty() {
+                        continue;
+                    }
+                    let n = bt.len();
+                    let wins = bt.iter().filter(|t| t.pnl_pct > 0.0).count();
+                    let wr = wins as f64 / n as f64 * 100.0;
+                    let tot: f64 = bt.iter().map(|t| t.pnl_pct).sum();
+                    let avg = tot / n as f64;
+                    let gw: f64 = bt.iter().filter(|t| t.pnl_pct > 0.0).map(|t| t.pnl_pct).sum();
+                    let gl: f64 = bt
+                        .iter()
+                        .filter(|t| t.pnl_pct < 0.0)
+                        .map(|t| t.pnl_pct.abs())
+                        .sum();
+                    let pf = if gl > 0.0 { gw / gl } else if gw > 0.0 { 99.0 } else { 0.0 };
+                    println!(
+                        "  {:20} {:>5} {:>5.1}% {:>+7.3}% {:>+7.2}% {:>5.2}",
+                        label, n, wr, avg, tot, pf
+                    );
+                }
+            }
+        }
+
+        // Holding period distribution — wins vs losses
+        if !self.trades.is_empty() {
+            println!("\n  --- Holding Period Analysis ---");
+            let buckets = [
+                ("1-4 candles (≤1h)", 1, 4),
+                ("5-12 (1-3h)", 5, 12),
+                ("13-24 (3-6h)", 13, 24),
+                ("25-48 (6-12h)", 25, 48),
+                ("49-96 (12-24h)", 49, 96),
+                ("97+ (>24h)", 97, 9999),
+            ];
+            println!(
+                "  {:20} {:>5} {:>6} {:>8} {:>5} {:>6}",
+                "Duration", "Trd", "Win%", "AvgPnL%", "Wins", "Losses"
+            );
+            for (label, lo, hi) in &buckets {
+                let bt: Vec<_> = self
+                    .trades
+                    .iter()
+                    .filter(|t| t.holding_periods >= *lo && t.holding_periods <= *hi)
+                    .collect();
+                if bt.is_empty() {
+                    continue;
+                }
+                let n = bt.len();
+                let wins = bt.iter().filter(|t| t.pnl_pct > 0.0).count();
+                let losses = n - wins;
+                let wr = wins as f64 / n as f64 * 100.0;
+                let avg: f64 = bt.iter().map(|t| t.pnl_pct).sum::<f64>() / n as f64;
+                println!(
+                    "  {:20} {:>5} {:>5.1}% {:>+7.3}% {:>5} {:>5}",
+                    label, n, wr, avg, wins, losses
+                );
+            }
+
+            // Win vs loss average holding
+            let win_holds: Vec<_> = self
+                .trades
+                .iter()
+                .filter(|t| t.pnl_pct > 0.0)
+                .map(|t| t.holding_periods)
+                .collect();
+            let loss_holds: Vec<_> = self
+                .trades
+                .iter()
+                .filter(|t| t.pnl_pct <= 0.0)
+                .map(|t| t.holding_periods)
+                .collect();
+            let avg_win_hold = if win_holds.is_empty() {
+                0.0
+            } else {
+                win_holds.iter().sum::<usize>() as f64 / win_holds.len() as f64
+            };
+            let avg_loss_hold = if loss_holds.is_empty() {
+                0.0
+            } else {
+                loss_holds.iter().sum::<usize>() as f64 / loss_holds.len() as f64
+            };
+            println!(
+                "  Avg Win Hold:  {:>5.1} candles ({:.1}h)  |  Avg Loss Hold: {:>5.1} candles ({:.1}h)",
+                avg_win_hold,
+                avg_win_hold * 0.25,
+                avg_loss_hold,
+                avg_loss_hold * 0.25
+            );
+        }
+
+        // Position sizing analysis
+        if !self.trades.is_empty() {
+            let sizes: Vec<f64> = self.trades.iter().map(|t| t.position_size_frac).collect();
+            let avg_size = sizes.iter().sum::<f64>() / sizes.len() as f64;
+            let min_size = sizes.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_size = sizes.iter().copied().fold(0.0_f64, f64::max);
+
+            // Correlation between size and outcome
+            let pnls: Vec<f64> = self.trades.iter().map(|t| t.pnl_pct).collect();
+            let avg_pnl = pnls.iter().sum::<f64>() / pnls.len() as f64;
+            let mut cov = 0.0_f64;
+            let mut var_s = 0.0_f64;
+            let mut var_p = 0.0_f64;
+            for (s, p) in sizes.iter().zip(pnls.iter()) {
+                cov += (s - avg_size) * (p - avg_pnl);
+                var_s += (s - avg_size).powi(2);
+                var_p += (p - avg_pnl).powi(2);
+            }
+            let corr = if var_s > 1e-10 && var_p > 1e-10 {
+                cov / (var_s.sqrt() * var_p.sqrt())
+            } else {
+                0.0
+            };
+
+            println!("\n  --- Position Sizing ---");
+            println!("  Avg Size:           {:>10.3} (fraction of equity)", avg_size);
+            println!("  Min/Max Size:       {:>10.3} / {:.3}", min_size, max_size);
+            println!(
+                "  Size-PnL Corr:      {:>10.3} {}",
+                corr,
+                if corr > 0.1 {
+                    "(larger positions = better outcomes)"
+                } else if corr < -0.1 {
+                    "(larger positions = worse outcomes!)"
+                } else {
+                    "(no significant correlation)"
+                }
+            );
+        }
+
+        // Fee impact analysis
+        if !self.trades.is_empty() {
+            let gross_profit: f64 = self
+                .trades
+                .iter()
+                .filter(|t| t.pnl_pct > 0.0)
+                .map(|t| t.pnl)
+                .sum();
+            let gross_loss: f64 = self
+                .trades
+                .iter()
+                .filter(|t| t.pnl_pct < 0.0)
+                .map(|t| t.pnl.abs())
+                .sum();
+            let fee_pct_of_profit = if gross_profit > 0.0 {
+                (total_tx_fees + total_funding) / gross_profit * 100.0
+            } else {
+                0.0
+            };
+            let fee_pct_of_volume = if !self.trades.is_empty() {
+                let total_volume: f64 = self.trades.iter().map(|t| t.size_usd).sum();
+                (total_tx_fees + total_funding) / total_volume * 100.0
+            } else {
+                0.0
+            };
+            let avg_fee_per_trade = (total_tx_fees + total_funding) / self.trades.len() as f64;
+
+            println!("\n  --- Fee Impact ---");
+            println!("  Gross Profit:       ${:>10.2}", gross_profit);
+            println!("  Gross Loss:         ${:>10.2}", gross_loss);
+            println!("  Total Fees:         ${:>10.2}", total_tx_fees + total_funding);
+            println!("  Fees / Gross Profit: {:>9.1}%", fee_pct_of_profit);
+            println!("  Fees / Volume:      {:>10.3}%", fee_pct_of_volume);
+            println!("  Avg Fee/Trade:      ${:>10.2}", avg_fee_per_trade);
+        }
+
+        // Win/Loss streak distribution
+        if !self.trades.is_empty() {
+            let mut streaks_win: Vec<usize> = Vec::new();
+            let mut streaks_loss: Vec<usize> = Vec::new();
+            let mut current_win = 0usize;
+            let mut current_loss = 0usize;
+            for t in &self.trades {
+                if t.pnl_pct > 0.0 {
+                    current_win += 1;
+                    if current_loss > 0 {
+                        streaks_loss.push(current_loss);
+                        current_loss = 0;
+                    }
+                } else {
+                    current_loss += 1;
+                    if current_win > 0 {
+                        streaks_win.push(current_win);
+                        current_win = 0;
+                    }
+                }
+            }
+            if current_win > 0 {
+                streaks_win.push(current_win);
+            }
+            if current_loss > 0 {
+                streaks_loss.push(current_loss);
+            }
+
+            println!("\n  --- Streak Analysis ---");
+            let avg_win_streak = if streaks_win.is_empty() {
+                0.0
+            } else {
+                streaks_win.iter().sum::<usize>() as f64 / streaks_win.len() as f64
+            };
+            let avg_loss_streak = if streaks_loss.is_empty() {
+                0.0
+            } else {
+                streaks_loss.iter().sum::<usize>() as f64 / streaks_loss.len() as f64
+            };
+            println!(
+                "  Win Streaks:   avg {:.1}, max {}, count {}",
+                avg_win_streak,
+                streaks_win.iter().max().unwrap_or(&0),
+                streaks_win.len()
+            );
+            println!(
+                "  Loss Streaks:  avg {:.1}, max {}, count {}",
+                avg_loss_streak,
+                streaks_loss.iter().max().unwrap_or(&0),
+                streaks_loss.len()
+            );
+        }
+
+        // MAE/MFE efficiency — how much of MFE is captured vs how much MAE is suffered
+        if !self.trades.is_empty() {
+            let trades_with_mfe: Vec<_> = self
+                .trades
+                .iter()
+                .filter(|t| t.max_favorable_excursion > 0.01)
+                .collect();
+            if !trades_with_mfe.is_empty() {
+                println!("\n  --- Trade Efficiency (MAE/MFE) ---");
+                // For winners: PnL / MFE = how much of the run was captured
+                let winners: Vec<_> = trades_with_mfe
+                    .iter()
+                    .filter(|t| t.pnl_pct > 0.0)
+                    .collect();
+                let losers: Vec<_> = trades_with_mfe
+                    .iter()
+                    .filter(|t| t.pnl_pct <= 0.0)
+                    .collect();
+
+                if !winners.is_empty() {
+                    let avg_capture: f64 = winners
+                        .iter()
+                        .map(|t| t.pnl_pct / t.max_favorable_excursion.max(0.01))
+                        .sum::<f64>()
+                        / winners.len() as f64;
+                    let avg_win_mae: f64 = winners
+                        .iter()
+                        .map(|t| t.max_adverse_excursion)
+                        .sum::<f64>()
+                        / winners.len() as f64;
+                    println!(
+                        "  Winners: avg capture {:.0}% of MFE, avg MAE {:.3}%",
+                        avg_capture * 100.0,
+                        avg_win_mae
+                    );
+                }
+                if !losers.is_empty() {
+                    let avg_loss_mfe: f64 = losers
+                        .iter()
+                        .map(|t| t.max_favorable_excursion)
+                        .sum::<f64>()
+                        / losers.len() as f64;
+                    let avg_loss_mae: f64 = losers
+                        .iter()
+                        .map(|t| t.max_adverse_excursion)
+                        .sum::<f64>()
+                        / losers.len() as f64;
+                    println!(
+                        "  Losers:  avg MFE {:.3}% (unrealized), avg MAE {:.3}%",
+                        avg_loss_mfe, avg_loss_mae
+                    );
+                    // How many losers actually had MFE > their loss
+                    let could_have_won = losers
+                        .iter()
+                        .filter(|t| t.max_favorable_excursion > t.pnl_pct.abs())
+                        .count();
+                    println!(
+                        "  Losers with MFE > |loss|: {} ({:.0}%) — were winners at some point",
+                        could_have_won,
+                        could_have_won as f64 / losers.len() as f64 * 100.0
+                    );
+                }
+            }
+        }
+
         println!("{}\n", "=".repeat(70));
     }
 

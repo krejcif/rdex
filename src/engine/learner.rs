@@ -150,6 +150,38 @@ impl ExcursionTracker {
             .unwrap_or(2.5)
     }
 
+    /// Report all learned SL/TP values for each pattern/side combination.
+    /// Returns: Vec<(key, sl_atr, tp_atr, adverse_count, favorable_count)>
+    pub fn report(&self) -> Vec<(String, f64, f64, u64, u64)> {
+        let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for k in self.adverse.keys() {
+            keys.insert(k.clone());
+        }
+        for k in self.favorable.keys() {
+            keys.insert(k.clone());
+        }
+        let mut report: Vec<_> = keys
+            .into_iter()
+            .map(|k| {
+                let sl = self
+                    .adverse
+                    .get(&k)
+                    .map(|s| s.value().clamp(1.0, 5.0))
+                    .unwrap_or(2.5);
+                let tp = self
+                    .favorable
+                    .get(&k)
+                    .map(|s| s.value().clamp(1.5, 8.0))
+                    .unwrap_or(4.0);
+                let adv_count = self.adverse.get(&k).map(|s| s.count).unwrap_or(0);
+                let fav_count = self.favorable.get(&k).map(|s| s.count).unwrap_or(0);
+                (k, sl, tp, adv_count, fav_count)
+            })
+            .collect();
+        report.sort_by(|a, b| a.0.cmp(&b.0));
+        report
+    }
+
     /// Adaptive take profit in ATR multiples. Tries side-specific first, falls back to pattern.
     pub fn get_tp_atr(&self, pattern_key: &str, side: &str) -> f64 {
         let side_key = format!("{}_{}", pattern_key, side);
@@ -248,6 +280,14 @@ impl LearningEngine {
             return self.hold_decision();
         }
 
+        // Adaptive min_edge: selected action must beat 'hold' by enough margin.
+        // Prevents low-conviction trades when Thompson is uncertain.
+        let action_mean = self.thompson.get_arm_mean(pool_key, &pattern, &action.0);
+        let hold_mean = self.thompson.get_arm_mean(pool_key, &pattern, "hold");
+        let min_edge = self.adaptive.min_edge();
+        if action_mean - hold_mean < min_edge {
+            return self.hold_decision();
+        }
 
         // Adaptive position sizing via Kelly criterion
         // Use observed win rate (not Thompson beta mean which is sigmoid-mapped reward)

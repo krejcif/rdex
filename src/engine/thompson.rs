@@ -272,6 +272,28 @@ impl ThompsonEngine {
         self.get_beta(symbol, context, &arm).params.mean()
     }
 
+    /// Get summary of all arm states for reporting.
+    /// Returns: Vec<(pattern_key, action, mean, evidence, variance)>
+    pub fn arm_report(&self, symbol: &str) -> Vec<(String, String, f64, f64, f64)> {
+        let mut report = Vec::new();
+        if let Some(contexts) = self.arms.get(symbol) {
+            for (ctx, arms) in contexts {
+                let pattern_key = format!("{}_{}", ctx.volatility_tier, ctx.trend_regime);
+                for (arm, db) in arms {
+                    report.push((
+                        pattern_key.clone(),
+                        arm.0.clone(),
+                        db.params.mean(),
+                        db.params.evidence(),
+                        db.params.variance(),
+                    ));
+                }
+            }
+        }
+        report.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        report
+    }
+
     /// Check if engine is uncertain about best arm (triggers dual-path)
     pub fn is_uncertain(&self, symbol: &str, context: &MarketContext, threshold: f64) -> bool {
         let mut means: Vec<f64> = self

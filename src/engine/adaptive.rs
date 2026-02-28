@@ -25,22 +25,22 @@ struct TradeOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveStats {
     pub total_trades: u64,
-    total_wins: u64,
-    total_candles_seen: u64,
+    pub total_wins: u64,
+    pub total_candles_seen: u64,
     /// EMA of trade PnL
-    ema_pnl: f64,
+    pub ema_pnl: f64,
     /// EMA of squared PnL (for variance)
-    ema_pnl_sq: f64,
+    pub ema_pnl_sq: f64,
     /// EMA of winning trade duration
-    ema_win_duration: f64,
+    pub ema_win_duration: f64,
     /// EMA of losing trade duration
-    ema_loss_duration: f64,
+    pub ema_loss_duration: f64,
     /// EMA of favorable excursion (ATR multiples)
-    ema_favorable: f64,
+    pub ema_favorable: f64,
     /// EMA of adverse excursion (ATR multiples)
-    ema_adverse: f64,
+    pub ema_adverse: f64,
     /// EMA of reward-to-risk ratio (favorable / adverse)
-    ema_rr_ratio: f64,
+    pub ema_rr_ratio: f64,
     /// EMA decay factor (adapts itself!)
     pub ema_decay: f64,
     /// EMA of KNN prediction accuracy (0..1)
@@ -141,6 +141,7 @@ impl AdaptiveParams {
     pub fn reward_k(&self) -> f64 {
         (1.0 / self.pnl_std()).clamp(0.5, 5.0)
     }
+
 
     /// Win rate from all-time statistics.
     pub fn overall_win_rate(&self) -> f64 {
@@ -286,6 +287,22 @@ impl AdaptiveParams {
     /// Current KNN prediction accuracy EMA.
     pub fn knn_accuracy(&self) -> f64 {
         self.stats.ema_knn_accuracy
+    }
+
+    /// Adaptive min_edge: Thompson arm must beat 'hold' by this margin.
+    /// When winning → lower edge (exploit more, trade more aggressively).
+    /// When losing → higher edge (be selective, only high-conviction trades).
+    /// Formula: (1 - recent_wr) * adverse / favorable — purely data-driven.
+    pub fn min_edge(&self) -> f64 {
+        if self.stats.total_trades < 15 {
+            return 0.02;
+        }
+        let wr = self.recent_win_rate().clamp(0.3, 0.8);
+        let loss_rate = 1.0 - wr;
+        // Scale by how much we lose relative to how much we gain
+        let adverse_favorable = self.stats.ema_adverse / self.stats.ema_favorable.max(0.01);
+        let edge = loss_rate * adverse_favorable;
+        edge.clamp(0.01, 0.10)
     }
 
     /// Confidence score [0, 1] based on recent performance and consistency.

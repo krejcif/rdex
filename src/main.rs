@@ -358,6 +358,278 @@ async fn run_backtest(
         );
     }
 
+    // ===== THOMPSON SAMPLING ARM STATE =====
+    println!("\n{}", "=".repeat(90));
+    println!("  THOMPSON SAMPLING — LEARNED ARM STATE (global pool)");
+    println!("{}", "=".repeat(90));
+    let arm_report = shared_learning.thompson.arm_report("_global");
+    if arm_report.is_empty() {
+        println!("  No arms learned yet.");
+    } else {
+        println!(
+            "  {:12} {:>8} {:>8} {:>10} {:>10} {:>10}",
+            "Pattern", "Action", "Mean", "Evidence", "Variance", "Status"
+        );
+        // Group by pattern to show side-by-side
+        let mut current_pattern = String::new();
+        for (pattern, action, mean, evidence, variance) in &arm_report {
+            if *pattern != current_pattern {
+                if !current_pattern.is_empty() {
+                    println!("  {}", "-".repeat(68));
+                }
+                current_pattern = pattern.clone();
+            }
+            let status = if *evidence < 5.0 {
+                "cold-start"
+            } else if *evidence < 20.0 {
+                "learning"
+            } else if *evidence < 50.0 {
+                "maturing"
+            } else {
+                "converged"
+            };
+            println!(
+                "  {:12} {:>8} {:>8.4} {:>10.1} {:>10.6} {:>10}",
+                pattern, action, mean, evidence, variance, status
+            );
+        }
+        // Summary: which patterns favor long vs short vs hold
+        println!("\n  --- Pattern Preferences ---");
+        let mut pattern_prefs: std::collections::HashMap<String, Vec<(String, f64)>> =
+            std::collections::HashMap::new();
+        for (pattern, action, mean, evidence, _) in &arm_report {
+            if *evidence > 5.0 {
+                pattern_prefs
+                    .entry(pattern.clone())
+                    .or_default()
+                    .push((action.clone(), *mean));
+            }
+        }
+        for (pattern, mut actions) in pattern_prefs {
+            actions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            if let Some((best_action, best_mean)) = actions.first() {
+                let second_mean = actions.get(1).map(|a| a.1).unwrap_or(0.0);
+                let edge = best_mean - second_mean;
+                println!(
+                    "  {:12} → {:>6} (mean={:.4}, edge={:+.4})",
+                    pattern, best_action, best_mean, edge
+                );
+            }
+        }
+    }
+
+    // ===== EXCURSION TRACKER STATE =====
+    println!("\n{}", "=".repeat(70));
+    println!("  EXCURSION TRACKER — LEARNED SL/TP (ATR multiples)");
+    println!("{}", "=".repeat(70));
+    let excursion_report = shared_learning.excursions.report();
+    if excursion_report.is_empty() {
+        println!("  No excursion data yet.");
+    } else {
+        println!(
+            "  {:20} {:>8} {:>8} {:>8} {:>8}",
+            "Pattern+Side", "SL(ATR)", "TP(ATR)", "AdvObs", "FavObs"
+        );
+        for (key, sl, tp, adv_n, fav_n) in &excursion_report {
+            let display = if key.len() > 20 {
+                &key[..20]
+            } else {
+                key.as_str()
+            };
+            println!(
+                "  {:20} {:>8.3} {:>8.3} {:>8} {:>8}",
+                display, sl, tp, adv_n, fav_n
+            );
+        }
+    }
+
+    // ===== ADAPTIVE PARAMETERS — RAW EMAs =====
+    println!("\n{}", "=".repeat(70));
+    println!("  ADAPTIVE PARAMETERS — RAW EMA STATE");
+    println!("{}", "=".repeat(70));
+    let s = &shared_learning.adaptive.stats;
+    println!("  EMA PnL:              {:>10.4}%", s.ema_pnl);
+    println!("  EMA PnL²:             {:>10.4}", s.ema_pnl_sq);
+    println!(
+        "  PnL Std (derived):    {:>10.4}%",
+        (s.ema_pnl_sq - s.ema_pnl * s.ema_pnl).max(0.01).sqrt()
+    );
+    println!("  EMA Win Duration:     {:>10.1} candles", s.ema_win_duration);
+    println!("  EMA Loss Duration:    {:>10.1} candles", s.ema_loss_duration);
+    println!(
+        "  Win/Loss Dur Ratio:   {:>10.2}",
+        s.ema_win_duration / s.ema_loss_duration.max(0.01)
+    );
+    println!("  EMA Favorable (ATR):  {:>10.3}", s.ema_favorable);
+    println!("  EMA Adverse (ATR):    {:>10.3}", s.ema_adverse);
+    println!("  EMA RR Ratio:         {:>10.3}", s.ema_rr_ratio);
+    println!("  EMA Decay:            {:>10.4}", s.ema_decay);
+    println!("  EMA KNN Accuracy:     {:>10.4}", s.ema_knn_accuracy);
+    println!("  Total Candles Seen:   {:>10}", s.total_candles_seen);
+
+    // ===== PATTERN DISTRIBUTION =====
+    println!("\n{}", "=".repeat(70));
+    println!("  PATTERN DISTRIBUTION (across all Phase 2 trades)");
+    println!("{}", "=".repeat(70));
+    {
+        let mut pattern_counts: std::collections::HashMap<String, (usize, usize, f64)> =
+            std::collections::HashMap::new();
+        for t in &all_phase2_trades {
+            if t.pattern.is_empty() {
+                continue;
+            }
+            let e = pattern_counts
+                .entry(t.pattern.clone())
+                .or_insert((0, 0, 0.0));
+            e.0 += 1;
+            if t.pnl_pct > 0.0 {
+                e.1 += 1;
+            }
+            e.2 += t.pnl_pct;
+        }
+        let mut patterns: Vec<_> = pattern_counts.into_iter().collect();
+        patterns.sort_by(|a, b| b.1 .2.partial_cmp(&a.1 .2).unwrap());
+
+        println!(
+            "  {:12} {:>6} {:>6} {:>8} {:>8}",
+            "Pattern", "Count", "Win%", "AvgPnL%", "TotPnL%"
+        );
+        for (pattern, (count, wins, total_pnl)) in &patterns {
+            let wr = if *count > 0 {
+                *wins as f64 / *count as f64 * 100.0
+            } else {
+                0.0
+            };
+            let avg = if *count > 0 {
+                total_pnl / *count as f64
+            } else {
+                0.0
+            };
+            println!(
+                "  {:12} {:>6} {:>5.1}% {:>+7.3}% {:>+7.2}%",
+                pattern, count, wr, avg, total_pnl
+            );
+        }
+
+        // Long vs short preference by pattern
+        let mut pattern_sides: std::collections::HashMap<
+            String,
+            (usize, usize, f64, f64),
+        > = std::collections::HashMap::new();
+        for t in &all_phase2_trades {
+            if t.pattern.is_empty() {
+                continue;
+            }
+            let e = pattern_sides
+                .entry(t.pattern.clone())
+                .or_insert((0, 0, 0.0, 0.0));
+            match t.side {
+                rdex::domain::PositionSide::Long => {
+                    e.0 += 1;
+                    e.2 += t.pnl_pct;
+                }
+                rdex::domain::PositionSide::Short => {
+                    e.1 += 1;
+                    e.3 += t.pnl_pct;
+                }
+                _ => {}
+            }
+        }
+        if !pattern_sides.is_empty() {
+            println!("\n  Per-Pattern Long/Short Split:");
+            println!(
+                "  {:12} {:>6} {:>8}  |  {:>6} {:>8}",
+                "Pattern", "Long#", "LongPnL%", "Short#", "ShortPnL%"
+            );
+            let mut sides: Vec<_> = pattern_sides.into_iter().collect();
+            sides.sort_by(|a, b| a.0.cmp(&b.0));
+            for (pattern, (longs, shorts, long_pnl, short_pnl)) in &sides {
+                println!(
+                    "  {:12} {:>6} {:>+7.2}%  |  {:>6} {:>+7.2}%",
+                    pattern, longs, long_pnl, shorts, short_pnl
+                );
+            }
+        }
+    }
+
+    // ===== CROSS-SYMBOL CORRELATION =====
+    if phase2_results.len() > 1 {
+        println!("\n{}", "=".repeat(70));
+        println!("  CROSS-SYMBOL COMPARISON");
+        println!("{}", "=".repeat(70));
+        println!(
+            "  {:10} {:>7} {:>7} {:>6} {:>7} {:>7} {:>7} {:>8} {:>7}",
+            "Symbol",
+            "Return%",
+            "Sharpe",
+            "Trades",
+            "WinR%",
+            "AvgWin",
+            "AvgLoss",
+            "Expect%",
+            "MaxDD%"
+        );
+        for (symbol, result) in &phase2_results {
+            let p = &result.performance;
+            let sym = if symbol.len() > 10 {
+                &symbol[..10]
+            } else {
+                symbol
+            };
+            println!(
+                "  {:10} {:>+6.2}% {:>7.2} {:>6} {:>6.1}% {:>+6.2}% {:>+6.2}% {:>+7.3}% {:>6.2}%",
+                sym,
+                p.total_return_pct,
+                p.sharpe_ratio,
+                p.total_trades,
+                p.win_rate * 100.0,
+                p.avg_win_pct,
+                p.avg_loss_pct,
+                p.expectancy,
+                p.max_drawdown_pct
+            );
+        }
+
+        // Identify best and worst performers
+        let best = phase2_results
+            .iter()
+            .max_by(|a, b| {
+                a.1.performance
+                    .total_return_pct
+                    .partial_cmp(&b.1.performance.total_return_pct)
+                    .unwrap()
+            })
+            .unwrap();
+        let worst = phase2_results
+            .iter()
+            .min_by(|a, b| {
+                a.1.performance
+                    .total_return_pct
+                    .partial_cmp(&b.1.performance.total_return_pct)
+                    .unwrap()
+            })
+            .unwrap();
+        println!(
+            "\n  Best:  {} ({:+.2}%)  |  Worst: {} ({:+.2}%)",
+            best.0,
+            best.1.performance.total_return_pct,
+            worst.0,
+            worst.1.performance.total_return_pct
+        );
+
+        // Consistency: how many symbols are profitable
+        let profitable = phase2_results
+            .iter()
+            .filter(|r| r.1.performance.total_return_pct > 0.0)
+            .count();
+        println!(
+            "  Profitable symbols: {}/{} ({:.0}%)",
+            profitable,
+            phase2_results.len(),
+            profitable as f64 / phase2_results.len() as f64 * 100.0
+        );
+    }
+
     // ===== FULL TRADE LOG =====
     println!("\n{}", "#".repeat(80));
     println!("  FULL TRADE LOG (all symbols, Phase 2)");
