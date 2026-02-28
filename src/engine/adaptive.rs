@@ -289,22 +289,6 @@ impl AdaptiveParams {
         self.stats.ema_knn_accuracy
     }
 
-    /// Adaptive min_edge: Thompson arm must beat 'hold' by this margin.
-    /// When winning → lower edge (exploit more, trade more aggressively).
-    /// When losing → higher edge (be selective, only high-conviction trades).
-    /// Formula: (1 - recent_wr) * adverse / favorable — purely data-driven.
-    pub fn min_edge(&self) -> f64 {
-        if self.stats.total_trades < 15 {
-            return 0.02;
-        }
-        let wr = self.recent_win_rate().clamp(0.3, 0.8);
-        let loss_rate = 1.0 - wr;
-        // Scale by how much we lose relative to how much we gain
-        let adverse_favorable = self.stats.ema_adverse / self.stats.ema_favorable.max(0.01);
-        let edge = loss_rate * adverse_favorable;
-        edge.clamp(0.01, 0.10)
-    }
-
     /// Confidence score [0, 1] based on recent performance and consistency.
     fn confidence_score(&self) -> f64 {
         if self.recent_outcomes.is_empty() {

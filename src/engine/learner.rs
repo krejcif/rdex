@@ -280,15 +280,6 @@ impl LearningEngine {
             return self.hold_decision();
         }
 
-        // Adaptive min_edge: selected action must beat 'hold' by enough margin.
-        // Prevents low-conviction trades when Thompson is uncertain.
-        let action_mean = self.thompson.get_arm_mean(pool_key, &pattern, &action.0);
-        let hold_mean = self.thompson.get_arm_mean(pool_key, &pattern, "hold");
-        let min_edge = self.adaptive.min_edge();
-        if action_mean - hold_mean < min_edge {
-            return self.hold_decision();
-        }
-
         // Adaptive position sizing via Kelly criterion
         // Use observed win rate (not Thompson beta mean which is sigmoid-mapped reward)
         // Cold-start: use neutral 0.5 win rate until we have enough trades
