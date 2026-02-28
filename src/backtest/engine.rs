@@ -1234,6 +1234,12 @@ impl InterleavedEngine {
     ) -> BacktestResult {
         let lookback = 60;
 
+        // Build symbol→candles index for O(1) lookup in the hot loop
+        let symbol_index: HashMap<&str, &[Candle]> = symbol_data
+            .iter()
+            .map(|(s, c)| (s.as_str(), c.as_slice()))
+            .collect();
+
         // Initialize per-symbol state
         for (symbol, _) in symbol_data {
             self.trade_managers
@@ -1282,21 +1288,28 @@ impl InterleavedEngine {
                 i += 1;
             }
 
-            // Process each symbol at this timestamp
+            // Pass 1: Update candle histories and mark-to-market for ALL symbols
+            // at this timestamp BEFORE any decisions, so all decisions use the
+            // same stable equity figure.
             for j in group_start..i {
                 let tag = &timeline[j].1;
                 let symbol = &tag.symbol;
-                let candle = &symbol_data
-                    .iter()
-                    .find(|(s, _)| s == symbol)
-                    .unwrap()
-                    .1[tag.candle_idx];
+                let candle = &symbol_index[symbol.as_str()][tag.candle_idx];
 
-                // Track candle history for this symbol
                 self.candle_histories
                     .get_mut(symbol)
                     .unwrap()
                     .push(candle.clone());
+
+                // Update mark-to-market with latest price
+                self.portfolio.update_mark_symbol(symbol, candle.close);
+            }
+
+            // Pass 2: Process decisions for each symbol using stable equity
+            for j in group_start..i {
+                let tag = &timeline[j].1;
+                let symbol = &tag.symbol;
+                let candle = &symbol_index[symbol.as_str()][tag.candle_idx];
 
                 let history_len = self.candle_histories[symbol].len();
 
@@ -1346,8 +1359,7 @@ impl InterleavedEngine {
         // Take the trade manager out to avoid borrow conflicts with &mut self
         let mut tm = self.trade_managers.remove(symbol).unwrap();
 
-        // Update mark-to-market for this symbol's position
-        self.portfolio.update_mark_symbol(symbol, candle.close);
+        // Mark-to-market already updated in Pass 1 of the interleaved loop.
 
         // Apply funding fee inline (avoids &mut self call)
         if self.portfolio.has_position_for(symbol) {

@@ -89,8 +89,8 @@ pub async fn load_or_fetch(
             let age_ms = chrono::Utc::now().timestamp_millis() - candles.last().unwrap().close_time;
             let age_hours = age_ms as f64 / 3_600_000.0;
 
-            // Use cache if less than 1 hour old
-            if age_hours < 1.0 {
+            // Use cache if less than 24 hours old (historical data doesn't change)
+            if age_hours < 24.0 {
                 println!(
                     "Using cached data for {} ({} candles, {:.1}h old)",
                     symbol,
@@ -172,7 +172,7 @@ pub async fn load_or_fetch_funding(
         if !rates.is_empty() {
             let age_ms = chrono::Utc::now().timestamp_millis() - rates.last().unwrap().funding_time;
             let age_hours = age_ms as f64 / 3_600_000.0;
-            if age_hours < 1.0 {
+            if age_hours < 24.0 {
                 println!(
                     "Using cached funding for {} ({} rates, {:.1}h old)",
                     symbol,

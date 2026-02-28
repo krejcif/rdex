@@ -22,17 +22,18 @@ src/
 │                            #   4 features × 2 bins = 16 patterns
 │
 ├── engine/                   # Decision-making & learning core
+│   ├── strategy.rs          # TradingStrategy trait — live/backtest separation boundary
 │   ├── thompson.rs          # Thompson Sampling (DecayingBeta, ThompsonEngine)
-│   ├── learner.rs           # LearningEngine — orchestrates everything
+│   ├── learner.rs           # LearningEngine — implements TradingStrategy, orchestrates everything
 │   ├── adaptive.rs          # AdaptiveParams — derives all trading params from data
 │   ├── pattern_library.rs   # KNN pattern library — temporal vectors, directional predictions
 │   ├── transfer.rs          # RegretTracker, PlateauDetector, TransferVerification
-│   └── trade_manager.rs     # TradeManager — position lifecycle (SL/TP, trailing, excursions)
+│   └── trade_manager.rs     # TradeManager — position lifecycle via impl TradingStrategy
 │
 ├── backtest/                 # Simulation framework
-│   ├── engine.rs            # BacktestEngine — candle-by-candle simulation
-│   ├── portfolio.rs         # Portfolio — equity, positions, fees, liquidation
-│   └── validation.rs        # Walk-forward validation, permutation tests, overfitting checks
+│   ├── engine.rs            # InterleavedEngine (multi-symbol) + BacktestEngine (single-symbol)
+│   ├── portfolio.rs         # MultiSymbolPortfolio (shared equity) + Portfolio (single-symbol)
+│   └── validation.rs        # Walk-forward validation, sign-flip permutation tests
 │
 ├── evaluation/               # Performance measurement
 │   ├── metrics.rs           # Sharpe, Sortino, Calmar, max drawdown, profit factor, etc.
@@ -68,9 +69,10 @@ graph TD
 
 | Component | Owns | Does NOT own |
 |-----------|------|--------------|
-| `BacktestEngine` | Candle iteration, anti-look-ahead, funding fees, portfolio orchestration | Trading logic, learning, position state |
-| `TradeManager` | SL/TP, trailing stops, excursion tracking, cooldown, exit reasons | Portfolio equity, order execution |
-| `LearningEngine` | Feature→pattern→action pipeline, Thompson state, excursion tracker | Position management, portfolio |
+| `InterleavedEngine` | Timeline merging, anti-look-ahead, two-pass processing, portfolio orchestration | Trading logic, learning, position state |
+| `TradingStrategy` trait | Contract between strategy and executor (decide, adaptive, record_outcome) | Implementation details |
+| `TradeManager` | SL/TP, trailing stops, excursion tracking, cooldown, exit reasons (via `impl TradingStrategy`) | Portfolio equity, order execution |
+| `LearningEngine` | Feature→pattern→action pipeline, Thompson state, excursion tracker (implements `TradingStrategy`) | Position management, portfolio |
 | `PatternLibrary` | KNN temporal vectors, directional probability predictions, per-symbol/global stores | Decision making, position management |
 | `AdaptiveParams` | All EMA-based trading parameters | Decision making |
-| `Portfolio` | Equity, position tracking, fee/slippage/liquidation calculation | When to trade |
+| `MultiSymbolPortfolio` | Shared equity, concurrent positions, aggregate exposure limits, margin tracking | When to trade |

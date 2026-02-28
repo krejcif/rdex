@@ -61,18 +61,22 @@ cargo run --bin rdex -- fetch -d 30             # Pre-fetch and cache market dat
 
 - **`domain/`** — Core types (`Candle`, `Symbol`, `MarketState`, `Position`, `FuturesConfig`), indicator computation (SMA, EMA, RSI, ATR, MACD, Bollinger, ADX). No business logic.
 - **`strategy/`** — Feature extraction (`MarketFeatures`) and pattern discretization. `PatternDiscretizer` uses adaptive median-split binning to produce 16 market patterns (4 features × 2 bins).
-- **`engine/`** — Decision-making core. `LearningEngine` orchestrates Thompson Sampling (`DecayingBeta` arms per symbol/context/strategy). `AdaptiveParams` derives all trading parameters (Kelly sizing, SL/TP, hold limits, cooldowns) from observed trade outcomes. `TradeManager` handles position lifecycle (entry/exit, trailing stops, excursion tracking). `PatternLibrary` provides KNN-based directional probability predictions from temporal feature vectors. `TransferLearning` copies learned arms between symbols when source plateaus.
-- **`backtest/`** — `BacktestEngine` feeds candles sequentially with anti-look-ahead enforcement. Signal flips (direction reversals) are blocked during the adaptive `min_hold` period to prevent noisy Thompson samples from causing premature exits. `Portfolio` tracks equity with Binance Futures mechanics (leverage, slippage, fees, funding, liquidation). `validation` provides walk-forward cross-validation and Monte Carlo permutation tests.
+- **`engine/`** — Decision-making core. `TradingStrategy` trait defines the boundary between trading logic and execution infrastructure (backtest or live). `LearningEngine` implements it, orchestrating Thompson Sampling (`DecayingBeta` arms per symbol/context/strategy). `AdaptiveParams` derives all trading parameters (Kelly sizing, SL/TP, hold limits, cooldowns) from observed trade outcomes. `TradeManager` handles position lifecycle (entry/exit, trailing stops, excursion tracking) through `impl TradingStrategy` — same code works for backtest and live. `PatternLibrary` provides KNN-based directional probability predictions from temporal feature vectors. `TransferLearning` copies learned arms between symbols when source plateaus.
+- **`backtest/`** — `InterleavedEngine` runs a single-pass chronological backtest across all symbols simultaneously, sharing one equity pool with concurrent positions (one per symbol max). `MultiSymbolPortfolio` manages shared equity with aggregate exposure limits and margin utilization tracking. Signal flips (direction reversals) are blocked during the adaptive `min_hold` period. `validation` provides walk-forward cross-validation and sign-flip permutation tests. The legacy `BacktestEngine` handles single-symbol backtests.
 - **`evaluation/`** — Performance metrics (Sharpe, Sortino, Calmar, max drawdown, profit factor) and reward scoring with adaptive sigmoid.
 - **`data/`** — Async Binance Futures API fetcher with CSV caching.
 
 ### Execution Flow
 
-Two-phase backtest: **Phase 1** runs symbols sequentially through one shared `LearningEngine` (patterns from BTC transfer to alts). **Phase 2** re-runs all symbols with the trained engine, then validates with walk-forward folds and permutation tests.
+Single-pass interleaved backtest: All symbols' candles are merged into one chronological timeline sorted by timestamp. The `InterleavedEngine` processes each timestamp group with a two-pass approach — Pass 1 updates mark-to-market prices for all symbols (so decisions use stable equity), Pass 2 processes trading decisions. One shared `LearningEngine` learns online from every trade as it happens. After the run, walk-forward validation and sign-flip permutation tests validate the results.
+
+### TradingStrategy Trait (Live/Backtest Separation)
+
+The `TradingStrategy` trait (`src/engine/strategy.rs`) defines the clean boundary between trading logic and execution infrastructure. `LearningEngine` implements it. `TradeManager` accepts `&impl TradingStrategy` — the same position lifecycle code works for both backtest and live trading. A live executor only needs to: feed candles → build `MarketState` → call `decide()` → execute via broker API → call `record_outcome()` on close.
 
 ### Critical Invariant: Anti-Look-Ahead
 
-`BacktestEngine` enforces that `MarketState` at candle `i` only contains data from candles `0..=i`. The `max_seen_index` field monotonically increases. Any code touching the backtest loop **must** preserve this — assertions will fire on violations. Indicators are computed from closed candle history only.
+Both `BacktestEngine` and `InterleavedEngine` enforce that `MarketState` at candle `i` only contains data from candles `0..=i`. The `InterleavedEngine` uses `max_seen_timestamp` (monotonically increasing) to verify chronological order across all symbols. Any code touching the backtest loop **must** preserve this — assertions will fire on violations. Indicators are computed from closed candle history only.
 
 ### ABSOLUTE RULE: Zero Constants, Zero Hardcoded Values
 
@@ -148,7 +152,7 @@ These were tested empirically and degraded performance. Do not attempt them agai
 
 ## Tests
 
-All tests are inline `#[cfg(test)]` modules within their source files (290 tests across 17 modules). Tests use `approx` for float comparisons and `tempfile` for I/O tests.
+All tests are inline `#[cfg(test)]` modules within their source files (314 tests across 18 modules). Tests use `approx` for float comparisons and `tempfile` for I/O tests.
 
 ## Documentation
 

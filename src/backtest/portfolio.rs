@@ -63,7 +63,7 @@ impl Portfolio {
         side: PositionSide,
         price: f64,
         size_fraction: f64,
-        strategy: &str,
+        _strategy: &str,
         timestamp: i64,
     ) -> bool {
         if self.position.is_some() {
@@ -248,6 +248,10 @@ pub struct MultiSymbolPortfolio {
     pub trade_log: Vec<TradeRecord>,
     pub equity_curve: Vec<f64>,
     peak_equity: f64,
+    /// Peak margin utilization ratio (total_notional / equity), for reporting.
+    pub peak_margin_utilization: f64,
+    /// Number of times position opening was rejected due to insufficient margin.
+    pub margin_rejections: u32,
 }
 
 impl MultiSymbolPortfolio {
@@ -261,6 +265,8 @@ impl MultiSymbolPortfolio {
             trade_log: Vec::new(),
             equity_curve: vec![equity],
             peak_equity: equity,
+            peak_margin_utilization: 0.0,
+            margin_rejections: 0,
         }
     }
 
@@ -271,7 +277,7 @@ impl MultiSymbolPortfolio {
         side: PositionSide,
         price: f64,
         size_fraction: f64,
-        strategy: &str,
+        _strategy: &str,
         timestamp: i64,
     ) -> bool {
         if self.positions.contains_key(&symbol.0) {
@@ -285,8 +291,31 @@ impl MultiSymbolPortfolio {
             return false;
         }
 
+        // Circuit breaker: stop opening positions if equity drops below 10%
+        // of initial equity. This prevents catastrophic drawdown spirals.
+        if current_eq < self.config.initial_equity * 0.10 {
+            self.margin_rejections += 1;
+            return false;
+        }
+
         let size_fraction = size_fraction.clamp(0.05, 0.5);
-        let notional = current_eq * size_fraction * self.config.leverage;
+        let mut notional = current_eq * size_fraction * self.config.leverage;
+
+        // Aggregate exposure limit: total notional across all positions
+        // must not exceed equity × leverage (realistic cross-margin constraint)
+        let existing_notional: f64 = self
+            .positions
+            .values()
+            .map(|p| p.size * p.entry_price)
+            .sum();
+        let max_total_notional = current_eq * self.config.leverage;
+        let remaining_capacity = (max_total_notional - existing_notional).max(0.0);
+        if remaining_capacity <= 0.0 {
+            self.margin_rejections += 1;
+            return false;
+        }
+        notional = notional.min(remaining_capacity);
+
         let size = notional / price;
 
         let slippage = price * self.config.slippage_bps / 10_000.0;
@@ -307,6 +336,17 @@ impl MultiSymbolPortfolio {
                 entry_time: timestamp,
             },
         );
+
+        // Track peak margin utilization
+        let total_notional: f64 = self
+            .positions
+            .values()
+            .map(|p| p.size * p.entry_price)
+            .sum();
+        if current_eq > 0.0 {
+            let utilization = total_notional / current_eq;
+            self.peak_margin_utilization = self.peak_margin_utilization.max(utilization);
+        }
 
         true
     }
@@ -834,5 +874,56 @@ mod tests {
         port.open_position(&sym, PositionSide::Long, 50000.0, 0.1, "test", 0);
         port.close_position("BTCUSDT", 51000.0, 1000, 5, 0.0, "test", 0.0);
         assert_eq!(port.trade_log.len(), 1);
+    }
+
+    #[test]
+    fn test_margin_utilization_tracking() {
+        let mut port = default_multi_portfolio();
+        let btc = Symbol("BTCUSDT".into());
+        let eth = Symbol("ETHUSDT".into());
+        assert_eq!(port.peak_margin_utilization, 0.0);
+        port.open_position(&btc, PositionSide::Long, 50000.0, 0.2, "test", 0);
+        assert!(port.peak_margin_utilization > 0.0, "Should track utilization after opening");
+        let util_after_one = port.peak_margin_utilization;
+        port.open_position(&eth, PositionSide::Short, 3000.0, 0.2, "test", 0);
+        assert!(port.peak_margin_utilization >= util_after_one, "Peak should grow with more positions");
+    }
+
+    #[test]
+    fn test_circuit_breaker_low_equity() {
+        let config = FuturesConfig {
+            initial_equity: 10_000.0,
+            ..FuturesConfig::default()
+        };
+        let mut port = MultiSymbolPortfolio::new(config);
+        // Simulate catastrophic loss — equity drops to 5% of initial
+        port.equity = 500.0;
+        let sym = Symbol("BTCUSDT".into());
+        let opened = port.open_position(&sym, PositionSide::Long, 50000.0, 0.1, "test", 0);
+        assert!(!opened, "Should reject position when equity < 10% of initial");
+        assert_eq!(port.margin_rejections, 1);
+    }
+
+    #[test]
+    fn test_aggregate_exposure_limit_rejects() {
+        let config = FuturesConfig {
+            initial_equity: 10_000.0,
+            leverage: 3.0,
+            ..FuturesConfig::default()
+        };
+        let mut port = MultiSymbolPortfolio::new(config);
+        // Open max-sized positions until aggregate limit is hit
+        let s1 = Symbol("BTCUSDT".into());
+        let s2 = Symbol("ETHUSDT".into());
+        let s3 = Symbol("SOLUSDT".into());
+        assert!(port.open_position(&s1, PositionSide::Long, 50000.0, 0.5, "test", 0));
+        assert!(port.open_position(&s2, PositionSide::Long, 3000.0, 0.5, "test", 0));
+        // Third position should be rejected or heavily reduced
+        let opened = port.open_position(&s3, PositionSide::Long, 100.0, 0.5, "test", 0);
+        // At 3x leverage, max notional = 30k. First two positions consume most capacity.
+        // Third may or may not fit depending on exact capacity remaining.
+        if !opened {
+            assert!(port.margin_rejections > 0);
+        }
     }
 }

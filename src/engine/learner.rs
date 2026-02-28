@@ -486,6 +486,63 @@ pub struct SymbolHealth {
     pub is_learning: bool,
 }
 
+impl super::strategy::TradingStrategy for LearningEngine {
+    fn decide(
+        &mut self,
+        state: &MarketState,
+        rng: &mut impl Rng,
+        library: &super::pattern_library::PatternLibrary,
+    ) -> TradingDecision {
+        // Calls the inherent method (inherent takes priority over trait in resolution)
+        self.decide(state, rng, library)
+    }
+
+    fn adaptive(&self) -> &super::adaptive::AdaptiveParams {
+        &self.adaptive
+    }
+
+    fn adaptive_mut(&mut self) -> &mut super::adaptive::AdaptiveParams {
+        &mut self.adaptive
+    }
+
+    fn record_outcome(
+        &mut self,
+        symbol: &str,
+        context: &MarketContext,
+        strategy_id: &StrategyId,
+        reward: f64,
+    ) {
+        self.record_outcome(symbol, context, strategy_id, reward)
+    }
+
+    fn record_excursion(
+        &mut self,
+        pattern_key: &str,
+        side: &str,
+        favorable_atr: f64,
+        adverse_atr: f64,
+        won: bool,
+    ) {
+        self.record_excursion(pattern_key, side, favorable_atr, adverse_atr, won)
+    }
+
+    fn record_hold(&mut self, symbol: &str, pattern: &MarketContext, recent_return: f64) {
+        self.record_hold(symbol, pattern, recent_return)
+    }
+
+    fn last_pattern(&self) -> Option<&MarketContext> {
+        self.last_pattern.as_ref()
+    }
+
+    fn last_prediction(&self) -> Option<f64> {
+        self.last_prediction
+    }
+
+    fn tick_candle(&mut self) {
+        self.adaptive.tick_candle()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

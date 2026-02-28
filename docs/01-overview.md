@@ -49,23 +49,21 @@ graph TD
 | **KNN PatternLibrary** | Finds similar historical market states, predicts direction | Recurring market microstructure |
 | **Decaying Beta** | Exponential decay on old evidence (window ≈ 200 trades) | Regime shifts — old patterns fade |
 
-## Two-Phase Backtest
+## Single-Pass Interleaved Backtest
 
 ```mermaid
 graph LR
-    subgraph Phase1[Phase 1: Sequential Learning]
-        BTC --> ETH --> SOL --> BNB --> XRP --> DOGE --> AVAX --> LINK
+    subgraph Interleaved[Single Pass: All Symbols Chronologically]
+        Timeline["Merge all candles<br/>Sort by timestamp"] --> Pass1["Pass 1: Update prices<br/>for all symbols"]
+        Pass1 --> Pass2["Pass 2: Process decisions<br/>using stable equity"]
+        Pass2 --> Learn["LearningEngine learns<br/>online from each trade"]
     end
 
-    subgraph Phase2[Phase 2: Exploitation]
-        Rerun[Re-run all with trained engine] --> WF[Walk-Forward 3 folds]
-        WF --> MC[Monte Carlo permutation]
-    end
-
-    Phase1 --> Phase2
+    Interleaved --> WF[Walk-Forward 3 folds]
+    WF --> MC[Sign-flip permutation test]
 ```
 
-One shared `LearningEngine` processes symbols in order. Each symbol's patterns accumulate into the shared Thompson engine. Phase 2 re-runs all symbols with the fully trained engine, then validates.
+One shared `LearningEngine` processes all symbols simultaneously in chronological order. The `InterleavedEngine` merges candle data from all symbols into a single timeline, grouped by timestamp. At each timestamp, Pass 1 updates mark-to-market prices for all symbols (so all decisions use the same stable equity figure), then Pass 2 processes trading decisions. The `MultiSymbolPortfolio` manages concurrent positions (one per symbol max) with shared equity and aggregate exposure limits. Learning happens online — each trade outcome immediately updates Thompson Sampling and adaptive parameters.
 
 ## CLI
 
@@ -85,6 +83,6 @@ rdex fetch -d 30 -s BTCUSDT,ETHUSDT
 
 ```mermaid
 graph TD
-    A[Binance FAPI<br/>public, no key] -->|15m OHLCV + 8h funding rates| B[CSV Cache<br/>data/ directory, 1h TTL]
-    B --> C[BacktestEngine<br/>sequential processing]
+    A[Binance FAPI<br/>public, no key] -->|15m OHLCV + 8h funding rates| B[CSV Cache<br/>data/ directory, 24h TTL]
+    B -->|Parallel fetch via JoinSet| C[InterleavedEngine<br/>single-pass chronological]
 ```

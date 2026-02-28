@@ -103,12 +103,26 @@ async fn run_backtest(
         days, equity, leverage
     );
 
-    // Fetch candle data + funding rates
+    // Fetch candle data + funding rates (parallel across symbols)
+    let mut fetch_set = tokio::task::JoinSet::new();
+    for symbol in symbols.clone() {
+        fetch_set.spawn(async move {
+            let candles = rdex::data::load_or_fetch(&symbol, days, "data")
+                .await
+                .map_err(|e| e.to_string());
+            let funding = rdex::data::load_or_fetch_funding(&symbol, days, "data")
+                .await
+                .map_err(|e| e.to_string());
+            (symbol, candles, funding)
+        });
+    }
+
     let mut all_data: Vec<(String, Vec<Candle>)> = Vec::new();
     let mut all_funding: std::collections::HashMap<String, Vec<FundingRate>> =
         std::collections::HashMap::new();
-    for symbol in &symbols {
-        let candles = rdex::data::load_or_fetch(symbol, days, "data").await?;
+    while let Some(result) = fetch_set.join_next().await {
+        let (symbol, candles_result, funding_result) = result?;
+        let candles = candles_result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         println!(
             "{}: {} candles ({:.1} days)",
             symbol,
@@ -116,12 +130,10 @@ async fn run_backtest(
             candles.len() as f64 / 96.0
         );
 
-        let funding = rdex::data::load_or_fetch_funding(symbol, days, "data")
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("  Warning: could not fetch funding for {}: {}", symbol, e);
-                Vec::new()
-            });
+        let funding = funding_result.unwrap_or_else(|e: String| {
+            eprintln!("  Warning: could not fetch funding for {}: {}", symbol, e);
+            Vec::new()
+        });
         if !funding.is_empty() {
             println!("  {} funding rates loaded", funding.len());
         }
@@ -129,6 +141,10 @@ async fn run_backtest(
         all_data.push((symbol.clone(), candles));
         all_funding.insert(symbol.clone(), funding);
     }
+    // Maintain consistent symbol ordering
+    all_data.sort_by(|a, b| {
+        symbols.iter().position(|s| s == &a.0).cmp(&symbols.iter().position(|s| s == &b.0))
+    });
 
     let config = FuturesConfig {
         leverage,
@@ -251,6 +267,16 @@ async fn run_backtest(
         "  Profit Factor:        {:>10.2}",
         result.performance.profit_factor
     );
+    println!(
+        "  Peak Margin Use:      {:>9.1}x",
+        engine.portfolio.peak_margin_utilization
+    );
+    if engine.portfolio.margin_rejections > 0 {
+        println!(
+            "  Margin Rejections:    {:>10}",
+            engine.portfolio.margin_rejections
+        );
+    }
     println!("  Total TX Fees:        ${:>9.2}", tx_fees);
     println!("  Total Funding Fees:   ${:>9.2}", fund_fees);
     println!(

@@ -1,4 +1,4 @@
-use super::learner::LearningEngine;
+use super::strategy::TradingStrategy;
 use crate::backtest::portfolio::TradeRecord;
 use crate::domain::*;
 use crate::evaluation::scorer;
@@ -100,7 +100,7 @@ impl TradeManager {
         &mut self,
         candle: &Candle,
         position: &Position,
-        learning: &LearningEngine,
+        strategy: &impl TradingStrategy,
     ) -> TradeAction {
         self.candles_held += 1;
 
@@ -129,11 +129,11 @@ impl TradeManager {
 
         // Adaptive trailing stop
         if self.entry_atr > 1e-10 {
-            self.update_trailing_stop(candle, position, learning);
+            self.update_trailing_stop(candle, position, strategy);
         }
 
         // Forced exit after adaptive max hold
-        let max_hold = learning.adaptive.max_hold();
+        let max_hold = strategy.adaptive().max_hold();
         if self.candles_held >= max_hold {
             return TradeAction::Exit {
                 price: candle.close,
@@ -150,9 +150,9 @@ impl TradeManager {
         &self,
         candle: &Candle,
         position: &Position,
-        learning: &LearningEngine,
+        strategy: &impl TradingStrategy,
     ) -> Option<(f64, ExitReason)> {
-        let min_hold = learning.adaptive.min_hold();
+        let min_hold = strategy.adaptive().min_hold();
         if self.candles_held < min_hold {
             return None;
         }
@@ -214,9 +214,9 @@ impl TradeManager {
         &mut self,
         symbol: &Symbol,
         record: &mut TradeRecord,
-        learning: &mut LearningEngine,
+        strategy: &mut impl TradingStrategy,
     ) {
-        let adaptive_k = learning.adaptive.reward_k();
+        let adaptive_k = strategy.adaptive().reward_k();
         let base_reward = scorer::pnl_to_reward(record.pnl_pct, adaptive_k);
 
         // Track KNN prediction accuracy separately for adaptive params
@@ -227,7 +227,7 @@ impl TradeManager {
             None => false,
         };
         if self.last_prediction_direction.is_some() {
-            learning.adaptive.record_prediction_accuracy(prediction_correct);
+            strategy.adaptive_mut().record_prediction_accuracy(prediction_correct);
         }
         // Pure PnL reward — blending prediction accuracy was tested and degraded clarity
         let reward = base_reward;
@@ -239,7 +239,7 @@ impl TradeManager {
         let adverse_atr = (self.max_adverse / 100.0 * entry) / atr;
 
         // Feed adaptive parameter engine
-        learning.adaptive.record_trade(
+        strategy.adaptive_mut().record_trade(
             record.pnl_pct,
             record.holding_periods,
             favorable_atr,
@@ -256,10 +256,10 @@ impl TradeManager {
                 }
             };
 
-            learning.record_outcome(&symbol.0, pattern, &StrategyId(action.to_string()), reward);
+            strategy.record_outcome(&symbol.0, pattern, &StrategyId(action.to_string()), reward);
 
             let pattern_key = PatternDiscretizer::pattern_key(pattern);
-            learning.record_excursion(
+            strategy.record_excursion(
                 &pattern_key,
                 action,
                 favorable_atr,
@@ -289,7 +289,7 @@ impl TradeManager {
     }
 
     /// Reset after position close. Sets cooldown from adaptive params.
-    pub fn reset(&mut self, learning: &LearningEngine) {
+    pub fn reset(&mut self, strategy: &impl TradingStrategy) {
         self.current_sl = None;
         self.current_tp = None;
         self.current_strategy.clear();
@@ -299,13 +299,13 @@ impl TradeManager {
         self.current_pattern = None;
         self.entry_atr = 0.0;
         self.accumulated_funding = 0.0;
-        self.cooldown_remaining = learning.adaptive.cooldown();
+        self.cooldown_remaining = strategy.adaptive().cooldown();
         self.last_prediction_direction = None;
     }
 
     /// Reset with a custom cooldown (e.g. forced exit uses longer cooldown).
-    pub fn reset_with_cooldown(&mut self, learning: &LearningEngine, cooldown: usize) {
-        self.reset(learning);
+    pub fn reset_with_cooldown(&mut self, strategy: &impl TradingStrategy, cooldown: usize) {
+        self.reset(strategy);
         self.cooldown_remaining = cooldown;
     }
 
@@ -320,7 +320,7 @@ impl TradeManager {
         &mut self,
         candle: &Candle,
         position: &Position,
-        learning: &LearningEngine,
+        strategy: &impl TradingStrategy,
     ) {
         let entry = position.entry_price;
         let atr = self.entry_atr;
@@ -330,9 +330,9 @@ impl TradeManager {
             PositionSide::Flat => 0.0,
         };
 
-        let trail_activation = learning.adaptive.trail_activation_atr();
-        let trail_dist = learning.adaptive.trail_distance_atr();
-        let breakeven_activation = learning.adaptive.breakeven_activation_atr();
+        let trail_activation = strategy.adaptive().trail_activation_atr();
+        let trail_dist = strategy.adaptive().trail_distance_atr();
+        let breakeven_activation = strategy.adaptive().breakeven_activation_atr();
 
         if profit_atr > trail_activation {
             let best_price = match position.side {
