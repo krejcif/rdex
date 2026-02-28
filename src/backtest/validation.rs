@@ -1,4 +1,4 @@
-use super::engine::BacktestEngine;
+use super::engine::{BacktestEngine, InterleavedEngine};
 use crate::domain::*;
 use crate::engine::learner::{LearnerConfig, LearningEngine};
 
@@ -70,8 +70,7 @@ pub fn permutation_test(
     n_permutations: usize,
     seed: u64,
 ) -> PermutationResult {
-    use rand::seq::SliceRandom;
-    use rand::SeedableRng;
+    use rand::{Rng, SeedableRng};
 
     if trade_pnls.is_empty() {
         return PermutationResult {
@@ -86,13 +85,14 @@ pub fn permutation_test(
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut random_returns = Vec::with_capacity(n_permutations);
 
+    // Sign-flip permutation: randomly flip each trade's P&L sign.
+    // Null hypothesis: strategy picks direction no better than a coin flip.
     for _ in 0..n_permutations {
-        let mut shuffled = trade_pnls.to_vec();
-        shuffled.shuffle(&mut rng);
-        let cum_return: f64 = shuffled
+        let sum_return: f64 = trade_pnls
             .iter()
-            .fold(1.0, |acc, &pnl| acc * (1.0 + pnl / 100.0));
-        random_returns.push((cum_return - 1.0) * 100.0);
+            .map(|&pnl| if rng.gen_bool(0.5) { pnl } else { -pnl })
+            .sum();
+        random_returns.push(sum_return);
     }
 
     random_returns.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -171,6 +171,96 @@ pub fn overfitting_check(
         warnings,
         likely_overfit: return_degradation > 0.7 || sharpe_degradation > 0.7,
     }
+}
+
+/// Walk-forward validation for interleaved multi-symbol backtest.
+/// Splits ALL symbols' data at the same time boundaries, runs InterleavedEngine
+/// for each fold with train + test periods.
+pub fn walk_forward_validation_interleaved(
+    symbol_data: &[(String, Vec<Candle>)],
+    all_funding: &std::collections::HashMap<String, Vec<FundingRate>>,
+    config: &FuturesConfig,
+    learner_config: &LearnerConfig,
+    n_folds: usize,
+    train_ratio: f64,
+) -> ValidationResult {
+    let warmup = 60;
+
+    // Find the global time range across all symbols
+    let min_len = symbol_data
+        .iter()
+        .map(|(_, c)| c.len())
+        .min()
+        .unwrap_or(0);
+
+    if min_len < warmup * 3 {
+        return ValidationResult {
+            fold_results: vec![],
+            is_valid: false,
+            reasons: vec!["Insufficient data for interleaved walk-forward".into()],
+        };
+    }
+
+    let fold_size = min_len / n_folds;
+    if fold_size < warmup * 2 {
+        return ValidationResult {
+            fold_results: vec![],
+            is_valid: false,
+            reasons: vec!["Fold size too small for interleaved walk-forward".into()],
+        };
+    }
+
+    let symbols: Vec<String> = symbol_data.iter().map(|(s, _)| s.clone()).collect();
+    let mut fold_results = Vec::new();
+
+    for fold in 0..n_folds {
+        let start = fold * fold_size;
+        let end = (start + fold_size).min(min_len);
+        let split = start + ((end - start) as f64 * train_ratio) as usize;
+
+        if split <= start + warmup || end <= split + warmup {
+            continue;
+        }
+
+        // Train: slice all symbols [start..split]
+        let train_data: Vec<(String, Vec<Candle>)> = symbol_data
+            .iter()
+            .map(|(s, c)| (s.clone(), c[start..split].to_vec()))
+            .collect();
+
+        let mut learning = LearningEngine::new(symbols.clone(), learner_config.clone());
+        let mut train_engine = InterleavedEngine::new(config.clone(), learning, fold as u64);
+        for (sym, funding) in all_funding {
+            train_engine.set_funding_rates(sym, funding);
+        }
+        let train_result = train_engine.run(&train_data, warmup);
+
+        // Test: slice all symbols [start..end], warmup = split - start
+        let test_data: Vec<(String, Vec<Candle>)> = symbol_data
+            .iter()
+            .map(|(s, c)| (s.clone(), c[start..end].to_vec()))
+            .collect();
+
+        learning = train_engine.learning;
+        let mut test_engine =
+            InterleavedEngine::new(config.clone(), learning, fold as u64 + 1000);
+        for (sym, funding) in all_funding {
+            test_engine.set_funding_rates(sym, funding);
+        }
+        let test_result = test_engine.run(&test_data, split - start);
+
+        fold_results.push(FoldResult {
+            fold,
+            train_return: train_result.performance.total_return_pct,
+            test_return: test_result.performance.total_return_pct,
+            test_sharpe: test_result.performance.sharpe_ratio,
+            test_drawdown: test_result.performance.max_drawdown_pct,
+            test_trades: test_result.performance.total_trades,
+            test_win_rate: test_result.performance.win_rate,
+        });
+    }
+
+    validate_results(&fold_results)
 }
 
 fn validate_results(folds: &[FoldResult]) -> ValidationResult {

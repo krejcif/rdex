@@ -1,5 +1,6 @@
 use crate::domain::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Portfolio state for Binance Futures backtesting
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +234,211 @@ impl Portfolio {
                 .as_ref()
                 .map(|p| p.unrealized_pnl)
                 .unwrap_or(0.0)
+    }
+}
+
+/// Multi-symbol portfolio with shared equity pool and concurrent positions.
+/// Each symbol can hold at most one position. Equity is shared across all.
+#[derive(Debug, Clone)]
+pub struct MultiSymbolPortfolio {
+    pub positions: HashMap<String, Position>,
+    pub equity: f64,
+    pub config: FuturesConfig,
+    pub realized_pnl: f64,
+    pub trade_log: Vec<TradeRecord>,
+    pub equity_curve: Vec<f64>,
+    peak_equity: f64,
+}
+
+impl MultiSymbolPortfolio {
+    pub fn new(config: FuturesConfig) -> Self {
+        let equity = config.initial_equity;
+        Self {
+            positions: HashMap::new(),
+            equity,
+            config,
+            realized_pnl: 0.0,
+            trade_log: Vec::new(),
+            equity_curve: vec![equity],
+            peak_equity: equity,
+        }
+    }
+
+    /// Open a new position for a symbol. Returns false if already positioned.
+    pub fn open_position(
+        &mut self,
+        symbol: &Symbol,
+        side: PositionSide,
+        price: f64,
+        size_fraction: f64,
+        strategy: &str,
+        timestamp: i64,
+    ) -> bool {
+        if self.positions.contains_key(&symbol.0) {
+            return false;
+        }
+        if side == PositionSide::Flat {
+            return false;
+        }
+        let current_eq = self.current_equity();
+        if current_eq <= 0.0 {
+            return false;
+        }
+
+        let size_fraction = size_fraction.clamp(0.05, 0.5);
+        let notional = current_eq * size_fraction * self.config.leverage;
+        let size = notional / price;
+
+        let slippage = price * self.config.slippage_bps / 10_000.0;
+        let entry_price = match side {
+            PositionSide::Long => price + slippage,
+            PositionSide::Short => price - slippage,
+            PositionSide::Flat => unreachable!(),
+        };
+
+        self.positions.insert(
+            symbol.0.clone(),
+            Position {
+                symbol: symbol.clone(),
+                side,
+                entry_price,
+                size,
+                unrealized_pnl: 0.0,
+                entry_time: timestamp,
+            },
+        );
+
+        true
+    }
+
+    /// Close a position for a specific symbol.
+    pub fn close_position(
+        &mut self,
+        symbol: &str,
+        price: f64,
+        timestamp: i64,
+        candles_held: usize,
+        max_adverse: f64,
+        strategy: &str,
+        accumulated_funding: f64,
+    ) -> Option<TradeRecord> {
+        let pos = self.positions.remove(symbol)?;
+
+        let slippage = price * self.config.slippage_bps / 10_000.0;
+        let exit_price = match pos.side {
+            PositionSide::Long => price - slippage,
+            PositionSide::Short => price + slippage,
+            PositionSide::Flat => return None,
+        };
+
+        let notional = pos.size * pos.entry_price;
+
+        let pnl = match pos.side {
+            PositionSide::Long => pos.size * (exit_price - pos.entry_price),
+            PositionSide::Short => pos.size * (pos.entry_price - exit_price),
+            PositionSide::Flat => 0.0,
+        };
+
+        let exit_notional = pos.size * exit_price;
+        let exit_fee = exit_notional * self.config.taker_fee;
+        let entry_fee = notional * self.config.taker_fee;
+        let total_tx_fees = entry_fee + exit_fee;
+
+        let net_pnl = pnl - entry_fee - exit_fee - accumulated_funding;
+        let pnl_pct = net_pnl / (notional / self.config.leverage) * 100.0;
+
+        self.equity += net_pnl;
+        self.realized_pnl += net_pnl;
+
+        let equity_at_exit = self.equity;
+
+        let record = TradeRecord {
+            symbol: pos.symbol.0,
+            side: pos.side,
+            entry_price: pos.entry_price,
+            exit_price,
+            size_usd: notional,
+            pnl: net_pnl,
+            pnl_pct,
+            entry_time: pos.entry_time,
+            exit_time: timestamp,
+            holding_periods: candles_held,
+            strategy: strategy.to_string(),
+            max_adverse_excursion: max_adverse,
+            max_favorable_excursion: 0.0,
+            fees_paid: total_tx_fees,
+            funding_fees_paid: accumulated_funding,
+            pattern: String::new(),
+            confidence: 0.0,
+            thompson_reward: 0.0,
+            entry_atr: 0.0,
+            exit_reason: String::new(),
+            equity_at_entry: 0.0,
+            equity_at_exit,
+            position_size_frac: 0.0,
+        };
+
+        self.trade_log.push(record.clone());
+        Some(record)
+    }
+
+    /// Update mark-to-market for a specific symbol's position.
+    pub fn update_mark_symbol(&mut self, symbol: &str, price: f64) {
+        if let Some(pos) = self.positions.get_mut(symbol) {
+            pos.unrealized_pnl = match pos.side {
+                PositionSide::Long => pos.size * (price - pos.entry_price),
+                PositionSide::Short => pos.size * (pos.entry_price - price),
+                PositionSide::Flat => 0.0,
+            };
+        }
+    }
+
+    /// Push a single equity curve snapshot (call once per timestamp, not per symbol).
+    pub fn push_equity_snapshot(&mut self) {
+        let eq = self.current_equity();
+        self.equity_curve.push(eq);
+        if eq > self.peak_equity {
+            self.peak_equity = eq;
+        }
+    }
+
+    /// Check if a specific symbol has a position.
+    pub fn has_position_for(&self, symbol: &str) -> bool {
+        self.positions.contains_key(symbol)
+    }
+
+    /// Check liquidation for a specific symbol's position.
+    pub fn check_liquidation_for(&self, symbol: &str, price: f64) -> bool {
+        let pos = match self.positions.get(symbol) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let notional = pos.size * pos.entry_price;
+        let margin = notional / self.config.leverage;
+        let unrealized = match pos.side {
+            PositionSide::Long => pos.size * (price - pos.entry_price),
+            PositionSide::Short => pos.size * (pos.entry_price - price),
+            PositionSide::Flat => 0.0,
+        };
+
+        unrealized < -margin * 0.95
+    }
+
+    /// Get the position for a symbol (immutable).
+    pub fn position_for(&self, symbol: &str) -> Option<&Position> {
+        self.positions.get(symbol)
+    }
+
+    /// Total equity = cash + sum of unrealized across all positions.
+    pub fn current_equity(&self) -> f64 {
+        let unrealized: f64 = self.positions.values().map(|p| p.unrealized_pnl).sum();
+        self.equity + unrealized
+    }
+
+    /// All symbols currently holding a position.
+    pub fn positioned_symbols(&self) -> Vec<String> {
+        self.positions.keys().cloned().collect()
     }
 }
 
@@ -510,6 +716,123 @@ mod tests {
         assert_eq!(port.trade_log.len(), 0);
         port.open_position(&sym, PositionSide::Long, 50000.0, 0.1, "test", 0);
         port.close_position(51000.0, 1000, 5, 0.0, "test", 0.0);
+        assert_eq!(port.trade_log.len(), 1);
+    }
+
+    // === MultiSymbolPortfolio tests ===
+
+    fn default_multi_portfolio() -> MultiSymbolPortfolio {
+        MultiSymbolPortfolio::new(FuturesConfig::default())
+    }
+
+    #[test]
+    fn test_multi_open_close_long() {
+        let mut port = default_multi_portfolio();
+        let sym = Symbol("BTCUSDT".into());
+        assert!(port.open_position(&sym, PositionSide::Long, 50000.0, 0.1, "test", 0));
+        assert!(port.has_position_for("BTCUSDT"));
+        let record = port.close_position("BTCUSDT", 51000.0, 1000, 5, 0.5, "test", 0.0).unwrap();
+        assert!(record.pnl > 0.0);
+        assert!(!port.has_position_for("BTCUSDT"));
+    }
+
+    #[test]
+    fn test_multi_concurrent_positions() {
+        let mut port = default_multi_portfolio();
+        let btc = Symbol("BTCUSDT".into());
+        let eth = Symbol("ETHUSDT".into());
+        assert!(port.open_position(&btc, PositionSide::Long, 50000.0, 0.1, "test", 0));
+        assert!(port.open_position(&eth, PositionSide::Short, 3000.0, 0.1, "test", 0));
+        assert!(port.has_position_for("BTCUSDT"));
+        assert!(port.has_position_for("ETHUSDT"));
+        assert_eq!(port.positions.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_cannot_double_open_same_symbol() {
+        let mut port = default_multi_portfolio();
+        let sym = Symbol("BTCUSDT".into());
+        assert!(port.open_position(&sym, PositionSide::Long, 50000.0, 0.1, "test", 0));
+        assert!(!port.open_position(&sym, PositionSide::Short, 50000.0, 0.1, "test", 1));
+    }
+
+    #[test]
+    fn test_multi_shared_equity() {
+        let mut port = default_multi_portfolio();
+        let btc = Symbol("BTCUSDT".into());
+        let eth = Symbol("ETHUSDT".into());
+        port.open_position(&btc, PositionSide::Long, 50000.0, 0.1, "test", 0);
+        port.update_mark_symbol("BTCUSDT", 51000.0);
+        // Opening ETH should use current_equity which includes BTC unrealized
+        let eq_before = port.current_equity();
+        assert!(eq_before > port.equity, "Unrealized should boost equity");
+        port.open_position(&eth, PositionSide::Long, 3000.0, 0.1, "test", 0);
+        assert!(port.has_position_for("ETHUSDT"));
+    }
+
+    #[test]
+    fn test_multi_equity_snapshot() {
+        let mut port = default_multi_portfolio();
+        assert_eq!(port.equity_curve.len(), 1); // initial
+        port.push_equity_snapshot();
+        assert_eq!(port.equity_curve.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_current_equity_includes_all_unrealized() {
+        let mut port = default_multi_portfolio();
+        let btc = Symbol("BTCUSDT".into());
+        let eth = Symbol("ETHUSDT".into());
+        port.open_position(&btc, PositionSide::Long, 50000.0, 0.1, "test", 0);
+        port.open_position(&eth, PositionSide::Long, 3000.0, 0.1, "test", 0);
+        port.update_mark_symbol("BTCUSDT", 51000.0);
+        port.update_mark_symbol("ETHUSDT", 3100.0);
+        let eq = port.current_equity();
+        assert!(eq > port.equity, "Should include unrealized from both positions");
+    }
+
+    #[test]
+    fn test_multi_close_nonexistent() {
+        let mut port = default_multi_portfolio();
+        let result = port.close_position("BTCUSDT", 50000.0, 1000, 5, 0.5, "test", 0.0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_multi_reject_flat() {
+        let mut port = default_multi_portfolio();
+        let sym = Symbol("BTCUSDT".into());
+        assert!(!port.open_position(&sym, PositionSide::Flat, 50000.0, 0.1, "test", 0));
+    }
+
+    #[test]
+    fn test_multi_liquidation_check() {
+        let mut port = default_multi_portfolio();
+        let sym = Symbol("BTCUSDT".into());
+        port.open_position(&sym, PositionSide::Long, 50000.0, 0.5, "test", 0);
+        assert!(!port.check_liquidation_for("BTCUSDT", 45000.0));
+        assert!(port.check_liquidation_for("BTCUSDT", 30000.0));
+    }
+
+    #[test]
+    fn test_multi_positioned_symbols() {
+        let mut port = default_multi_portfolio();
+        let btc = Symbol("BTCUSDT".into());
+        let eth = Symbol("ETHUSDT".into());
+        port.open_position(&btc, PositionSide::Long, 50000.0, 0.1, "test", 0);
+        port.open_position(&eth, PositionSide::Short, 3000.0, 0.1, "test", 0);
+        let syms = port.positioned_symbols();
+        assert_eq!(syms.len(), 2);
+        assert!(syms.contains(&"BTCUSDT".to_string()));
+        assert!(syms.contains(&"ETHUSDT".to_string()));
+    }
+
+    #[test]
+    fn test_multi_trade_log_grows() {
+        let mut port = default_multi_portfolio();
+        let sym = Symbol("BTCUSDT".into());
+        port.open_position(&sym, PositionSide::Long, 50000.0, 0.1, "test", 0);
+        port.close_position("BTCUSDT", 51000.0, 1000, 5, 0.0, "test", 0.0);
         assert_eq!(port.trade_log.len(), 1);
     }
 }

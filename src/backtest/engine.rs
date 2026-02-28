@@ -1175,6 +1175,486 @@ impl BacktestResult {
     }
 }
 
+/// Single-pass interleaved multi-symbol backtest engine.
+/// All symbols share one equity pool and one LearningEngine.
+/// Candles are merged chronologically and processed in timestamp order.
+pub struct InterleavedEngine {
+    pub portfolio: super::portfolio::MultiSymbolPortfolio,
+    pub learning: LearningEngine,
+    pub library: PatternLibrary,
+    rng: StdRng,
+    trade_managers: HashMap<String, TradeManager>,
+    funding_rates: HashMap<String, HashMap<i64, f64>>,
+    /// ANTI-LOOKAHEAD: monotonically increasing timestamp
+    max_seen_timestamp: i64,
+    /// Per-symbol candle histories for MarketState construction
+    candle_histories: HashMap<String, Vec<Candle>>,
+}
+
+/// A candle tagged with its symbol, for timeline merging.
+struct TaggedCandle {
+    symbol: String,
+    candle_idx: usize,
+}
+
+impl InterleavedEngine {
+    pub fn new(config: FuturesConfig, learning: LearningEngine, seed: u64) -> Self {
+        Self {
+            portfolio: super::portfolio::MultiSymbolPortfolio::new(config),
+            learning,
+            library: PatternLibrary::with_defaults(),
+            rng: StdRng::seed_from_u64(seed),
+            trade_managers: HashMap::new(),
+            funding_rates: HashMap::new(),
+            max_seen_timestamp: i64::MIN,
+            candle_histories: HashMap::new(),
+        }
+    }
+
+    /// Set funding rates for a specific symbol.
+    pub fn set_funding_rates(&mut self, symbol: &str, rates: &[FundingRate]) {
+        let map: HashMap<i64, f64> = rates
+            .iter()
+            .map(|r| (r.funding_time, r.funding_rate))
+            .collect();
+        self.funding_rates.insert(symbol.to_string(), map);
+    }
+
+    /// Run single-pass interleaved backtest on all symbols.
+    ///
+    /// ANTI-LOOK-AHEAD GUARANTEES:
+    /// 1. Timeline is sorted by open_time; all symbols interleaved chronologically
+    /// 2. max_seen_timestamp monotonically increases
+    /// 3. MarketState built from candle history up to current index only
+    /// 4. LearningEngine learns online from each trade as it happens
+    pub fn run(
+        &mut self,
+        symbol_data: &[(String, Vec<Candle>)],
+        warmup: usize,
+    ) -> BacktestResult {
+        let lookback = 60;
+
+        // Initialize per-symbol state
+        for (symbol, _) in symbol_data {
+            self.trade_managers
+                .entry(symbol.clone())
+                .or_insert_with(TradeManager::new);
+            self.candle_histories
+                .entry(symbol.clone())
+                .or_insert_with(Vec::new);
+        }
+
+        // Build merged timeline: (open_time, symbol, candle_index_in_symbol_data)
+        let mut timeline: Vec<(i64, TaggedCandle)> = Vec::new();
+        for (symbol, candles) in symbol_data {
+            for (idx, candle) in candles.iter().enumerate() {
+                timeline.push((
+                    candle.open_time,
+                    TaggedCandle {
+                        symbol: symbol.clone(),
+                        candle_idx: idx,
+                    },
+                ));
+            }
+        }
+        timeline.sort_by_key(|(ts, _)| *ts);
+
+        // Group by timestamp
+        let mut i = 0;
+        while i < timeline.len() {
+            let current_ts = timeline[i].0;
+
+            // Anti-look-ahead assertion
+            assert!(
+                current_ts >= self.max_seen_timestamp,
+                "LOOK-AHEAD VIOLATION: timestamp {} after seeing {}",
+                current_ts,
+                self.max_seen_timestamp
+            );
+            self.max_seen_timestamp = current_ts;
+
+            // Tick adaptive params once per timestamp
+            self.learning.adaptive.tick_candle();
+
+            // Collect all candles at this timestamp
+            let group_start = i;
+            while i < timeline.len() && timeline[i].0 == current_ts {
+                i += 1;
+            }
+
+            // Process each symbol at this timestamp
+            for j in group_start..i {
+                let tag = &timeline[j].1;
+                let symbol = &tag.symbol;
+                let candle = &symbol_data
+                    .iter()
+                    .find(|(s, _)| s == symbol)
+                    .unwrap()
+                    .1[tag.candle_idx];
+
+                // Track candle history for this symbol
+                self.candle_histories
+                    .get_mut(symbol)
+                    .unwrap()
+                    .push(candle.clone());
+
+                let history_len = self.candle_histories[symbol].len();
+
+                // Skip warmup period per symbol
+                if history_len < warmup + lookback {
+                    continue;
+                }
+
+                self.process_symbol_candle(symbol, candle, lookback);
+            }
+
+            // One equity snapshot per timestamp
+            self.portfolio.push_equity_snapshot();
+        }
+
+        // Close all remaining positions
+        for (symbol, candles) in symbol_data {
+            if self.portfolio.has_position_for(symbol) {
+                if let Some(last) = candles.last() {
+                    let tm = self.trade_managers.get_mut(symbol).unwrap();
+                    tm.exit_reason = "end_of_data".to_string();
+                    if let Some(mut record) = self.portfolio.close_position(
+                        symbol,
+                        last.close,
+                        last.close_time,
+                        tm.candles_held,
+                        tm.max_adverse,
+                        &tm.current_strategy,
+                        tm.accumulated_funding,
+                    ) {
+                        let sym = Symbol(symbol.clone());
+                        tm.on_exit(&sym, &mut record, &mut self.learning);
+                        *self.portfolio.trade_log.last_mut().unwrap() = record;
+                    }
+                }
+            }
+        }
+
+        self.build_result()
+    }
+
+    /// Process a single candle for a single symbol within the interleaved loop.
+    /// Uses take-and-replace pattern for TradeManager to avoid borrow conflicts.
+    fn process_symbol_candle(&mut self, symbol: &str, candle: &Candle, lookback: usize) {
+        let sym = Symbol(symbol.to_string());
+
+        // Take the trade manager out to avoid borrow conflicts with &mut self
+        let mut tm = self.trade_managers.remove(symbol).unwrap();
+
+        // Update mark-to-market for this symbol's position
+        self.portfolio.update_mark_symbol(symbol, candle.close);
+
+        // Apply funding fee inline (avoids &mut self call)
+        if self.portfolio.has_position_for(symbol) {
+            if let Some(pos) = self.portfolio.position_for(symbol).cloned() {
+                if let Some(rates) = self.funding_rates.get(symbol) {
+                    let funding_interval_ms: i64 = 8 * 3600 * 1000;
+                    let first_funding =
+                        (candle.open_time / funding_interval_ms) * funding_interval_ms;
+                    let mut funding_time = first_funding;
+                    while funding_time <= candle.close_time {
+                        if funding_time >= candle.open_time {
+                            let rate = rates.get(&funding_time).copied().unwrap_or(0.0);
+                            let notional = pos.size * pos.entry_price;
+                            let fee = match pos.side {
+                                PositionSide::Long => notional * rate,
+                                PositionSide::Short => -notional * rate,
+                                PositionSide::Flat => 0.0,
+                            };
+                            tm.add_funding(fee);
+                            self.portfolio.equity -= fee;
+                        }
+                        funding_time += funding_interval_ms;
+                    }
+                }
+            }
+        }
+
+        // Check liquidation
+        let liq_price = match self.portfolio.position_for(symbol).map(|p| p.side) {
+            Some(PositionSide::Long) => candle.low,
+            Some(PositionSide::Short) => candle.high,
+            _ => candle.close,
+        };
+        if self.portfolio.check_liquidation_for(symbol, liq_price) {
+            tm.exit_reason = "liquidation".to_string();
+            let close_price = match self.portfolio.position_for(symbol).map(|p| p.side) {
+                Some(PositionSide::Long) => candle.low,
+                Some(PositionSide::Short) => candle.high,
+                _ => candle.close,
+            };
+            if let Some(mut record) = self.portfolio.close_position(
+                symbol,
+                close_price,
+                candle.close_time,
+                tm.candles_held,
+                tm.max_adverse,
+                &tm.current_strategy,
+                tm.accumulated_funding,
+            ) {
+                tm.on_exit(&sym, &mut record, &mut self.learning);
+                *self.portfolio.trade_log.last_mut().unwrap() = record;
+            }
+            tm.reset(&self.learning);
+            self.trade_managers.insert(symbol.to_string(), tm);
+            return;
+        }
+
+        // SL/TP check
+        if self.portfolio.has_position_for(symbol) {
+            let pos = self.portfolio.position_for(symbol).unwrap().clone();
+            if let Some((exit_price, reason)) = tm.check_sl_tp(candle, &pos, &self.learning) {
+                tm.exit_reason = reason.to_string();
+                if let Some(mut record) = self.portfolio.close_position(
+                    symbol,
+                    exit_price,
+                    candle.close_time,
+                    tm.candles_held,
+                    tm.max_adverse,
+                    &tm.current_strategy,
+                    tm.accumulated_funding,
+                ) {
+                    tm.on_exit(&sym, &mut record, &mut self.learning);
+                    *self.portfolio.trade_log.last_mut().unwrap() = record;
+                }
+                tm.reset(&self.learning);
+            }
+        }
+
+        // Trailing stops, excursion tracking, max hold
+        if self.portfolio.has_position_for(symbol) {
+            let pos = self.portfolio.position_for(symbol).unwrap().clone();
+            let action = tm.on_candle(candle, &pos, &self.learning);
+
+            if let TradeAction::Exit { price, reason } = action {
+                tm.exit_reason = reason.to_string();
+                if let Some(mut record) = self.portfolio.close_position(
+                    symbol,
+                    price,
+                    candle.close_time,
+                    tm.candles_held,
+                    tm.max_adverse,
+                    &tm.current_strategy,
+                    tm.accumulated_funding,
+                ) {
+                    tm.on_exit(&sym, &mut record, &mut self.learning);
+                    *self.portfolio.trade_log.last_mut().unwrap() = record;
+                }
+                let cooldown = match reason {
+                    ExitReason::MaxHold => (self.learning.adaptive.cooldown() * 2).min(48),
+                    _ => self.learning.adaptive.cooldown(),
+                };
+                tm.reset_with_cooldown(&self.learning, cooldown);
+                self.trade_managers.insert(symbol.to_string(), tm);
+                return;
+            }
+        }
+
+        // Cooldown
+        if tm.tick_cooldown() {
+            self.trade_managers.insert(symbol.to_string(), tm);
+            return;
+        }
+
+        // Build market state from this symbol's candle history only
+        let history = &self.candle_histories[symbol];
+        let idx = history.len() - 1;
+        let state = match build_market_state(&sym, history, idx, lookback) {
+            Some(s) => s,
+            None => {
+                self.trade_managers.insert(symbol.to_string(), tm);
+                return;
+            }
+        };
+
+        let current_atr = state.indicators.atr_14;
+
+        // Feed pattern library
+        if let Some(features) = MarketFeatures::extract(&state) {
+            let closes: Vec<f64> = history.iter().map(|c| c.close).collect();
+            let highs: Vec<f64> = history.iter().map(|c| c.high).collect();
+            let lows: Vec<f64> = history.iter().map(|c| c.low).collect();
+            let slices = CandleSlices {
+                closes: &closes,
+                highs: &highs,
+                lows: &lows,
+            };
+            self.library
+                .on_candle(symbol, &features.as_array(), idx, &slices);
+        }
+
+        // Make decision
+        let decision = self.learning.decide(&state, &mut self.rng, &self.library);
+
+        // Record hold observation periodically
+        if !self.portfolio.has_position_for(symbol) && decision.signal == TradeSignal::Hold {
+            if idx % 10 == 0 {
+                if let Some(pattern) = self.learning.last_pattern.clone() {
+                    let lookback_start = if idx >= 10 { idx - 10 } else { 0 };
+                    let recent_return = (candle.close - history[lookback_start].close)
+                        / history[lookback_start].close
+                        * 100.0;
+                    self.learning.record_hold(symbol, &pattern, recent_return);
+                }
+            }
+        }
+
+        // Execute decision
+        let should_execute = if self.portfolio.has_position_for(symbol) {
+            let min_hold = self.learning.adaptive.min_hold();
+            tm.candles_held >= min_hold
+        } else {
+            true
+        };
+
+        // Put tm back before execute_decision which needs &mut self
+        self.trade_managers.insert(symbol.to_string(), tm);
+
+        if should_execute {
+            self.execute_decision(symbol, &decision, candle, current_atr);
+        }
+    }
+
+    fn execute_decision(
+        &mut self,
+        symbol: &str,
+        decision: &TradingDecision,
+        candle: &Candle,
+        atr: f64,
+    ) {
+        let sym = Symbol(symbol.to_string());
+        let tm = self.trade_managers.get_mut(symbol).unwrap();
+
+        match decision.signal {
+            TradeSignal::Hold => {}
+            TradeSignal::Close => {
+                if self.portfolio.has_position_for(symbol) {
+                    tm.exit_reason = "signal_close".to_string();
+                    if let Some(mut record) = self.portfolio.close_position(
+                        symbol,
+                        candle.close,
+                        candle.close_time,
+                        tm.candles_held,
+                        tm.max_adverse,
+                        &decision.strategy_name,
+                        tm.accumulated_funding,
+                    ) {
+                        tm.on_exit(&sym, &mut record, &mut self.learning);
+                        *self.portfolio.trade_log.last_mut().unwrap() = record;
+                    }
+                    tm.reset(&self.learning);
+                }
+            }
+            TradeSignal::Long => {
+                if self.portfolio.has_position_for(symbol) {
+                    let pos_side = self.portfolio.position_for(symbol).unwrap().side;
+                    if pos_side == PositionSide::Short {
+                        tm.exit_reason = "signal_flip".to_string();
+                        let strat = tm.current_strategy.clone();
+                        if let Some(mut record) = self.portfolio.close_position(
+                            symbol,
+                            candle.close,
+                            candle.close_time,
+                            tm.candles_held,
+                            tm.max_adverse,
+                            &strat,
+                            tm.accumulated_funding,
+                        ) {
+                            tm.on_exit(&sym, &mut record, &mut self.learning);
+                            *self.portfolio.trade_log.last_mut().unwrap() = record;
+                        }
+                        tm.reset(&self.learning);
+                    } else {
+                        return; // already long
+                    }
+                }
+                if self.portfolio.open_position(
+                    &sym,
+                    PositionSide::Long,
+                    candle.close,
+                    decision.size,
+                    &decision.strategy_name,
+                    candle.close_time,
+                ) {
+                    tm.on_entry(
+                        decision,
+                        atr,
+                        self.learning.last_pattern.clone(),
+                        self.portfolio.current_equity(),
+                        self.learning.last_prediction,
+                    );
+                }
+            }
+            TradeSignal::Short => {
+                if self.portfolio.has_position_for(symbol) {
+                    let pos_side = self.portfolio.position_for(symbol).unwrap().side;
+                    if pos_side == PositionSide::Long {
+                        tm.exit_reason = "signal_flip".to_string();
+                        let strat = tm.current_strategy.clone();
+                        if let Some(mut record) = self.portfolio.close_position(
+                            symbol,
+                            candle.close,
+                            candle.close_time,
+                            tm.candles_held,
+                            tm.max_adverse,
+                            &strat,
+                            tm.accumulated_funding,
+                        ) {
+                            tm.on_exit(&sym, &mut record, &mut self.learning);
+                            *self.portfolio.trade_log.last_mut().unwrap() = record;
+                        }
+                        tm.reset(&self.learning);
+                    } else {
+                        return; // already short
+                    }
+                }
+                if self.portfolio.open_position(
+                    &sym,
+                    PositionSide::Short,
+                    candle.close,
+                    decision.size,
+                    &decision.strategy_name,
+                    candle.close_time,
+                ) {
+                    tm.on_entry(
+                        decision,
+                        atr,
+                        self.learning.last_pattern.clone(),
+                        self.portfolio.current_equity(),
+                        self.learning.last_prediction,
+                    );
+                }
+            }
+        }
+    }
+
+    fn build_result(&self) -> BacktestResult {
+        let days = if self.portfolio.equity_curve.len() > 1 {
+            (self.portfolio.equity_curve.len() - 1) as f64 / 96.0
+        } else {
+            1.0
+        };
+
+        let performance = metrics::calculate_metrics(
+            &self.portfolio.equity_curve,
+            &self.portfolio.trade_log,
+            days,
+        );
+
+        BacktestResult {
+            performance,
+            trades: self.portfolio.trade_log.clone(),
+            final_equity: self.portfolio.current_equity(),
+            health: self.learning.health_report(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,5 +1720,106 @@ mod tests {
         let mut candles = make_trending_candles(200, 50000.0, 10.0);
         candles.swap(100, 50);
         let _result = bt.run(&Symbol("BTCUSDT".into()), &candles, 60);
+    }
+
+    // === InterleavedEngine tests ===
+
+    #[test]
+    fn test_interleaved_single_symbol() {
+        let symbols = vec!["BTCUSDT".to_string()];
+        let learning = LearningEngine::new(symbols, LearnerConfig::default());
+        let mut engine = InterleavedEngine::new(FuturesConfig::default(), learning, 42);
+        let candles = make_trending_candles(200, 50000.0, 10.0);
+        let data = vec![("BTCUSDT".to_string(), candles)];
+        let result = engine.run(&data, 60);
+        assert!(result.final_equity > 0.0);
+        assert!(!result.performance.equity_curve.is_empty());
+    }
+
+    #[test]
+    fn test_interleaved_multi_symbol() {
+        let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+        let learning = LearningEngine::new(symbols, LearnerConfig::default());
+        let mut engine = InterleavedEngine::new(FuturesConfig::default(), learning, 42);
+        let btc_candles = make_trending_candles(200, 50000.0, 10.0);
+        let eth_candles = make_trending_candles(200, 3000.0, 0.5);
+        let data = vec![
+            ("BTCUSDT".to_string(), btc_candles),
+            ("ETHUSDT".to_string(), eth_candles),
+        ];
+        let result = engine.run(&data, 60);
+        assert!(result.final_equity > 0.0);
+        // Trade log may contain trades from both symbols
+        let btc_trades: Vec<_> = result.trades.iter().filter(|t| t.symbol == "BTCUSDT").collect();
+        let eth_trades: Vec<_> = result.trades.iter().filter(|t| t.symbol == "ETHUSDT").collect();
+        // At least one symbol should have some equity curve data
+        assert!(!result.performance.equity_curve.is_empty());
+        // Combined trade log should be the sum
+        assert_eq!(
+            btc_trades.len() + eth_trades.len(),
+            result.trades.len()
+        );
+    }
+
+    #[test]
+    fn test_interleaved_shared_equity() {
+        let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+        let learning = LearningEngine::new(symbols, LearnerConfig::default());
+        let config = FuturesConfig {
+            initial_equity: 10_000.0,
+            ..FuturesConfig::default()
+        };
+        let mut engine = InterleavedEngine::new(config, learning, 42);
+        let btc_candles = make_trending_candles(200, 50000.0, 10.0);
+        let eth_candles = make_trending_candles(200, 3000.0, 0.5);
+        let data = vec![
+            ("BTCUSDT".to_string(), btc_candles),
+            ("ETHUSDT".to_string(), eth_candles),
+        ];
+        let result = engine.run(&data, 60);
+        // Final equity should be a single number reflecting all symbols
+        assert!(result.final_equity > 0.0);
+    }
+
+    #[test]
+    fn test_interleaved_anti_lookahead_sorts_timeline() {
+        // InterleavedEngine sorts timeline by timestamp, so out-of-order input
+        // data gets correctly ordered. Verify it runs without panic.
+        let symbols = vec!["BTCUSDT".to_string()];
+        let learning = LearningEngine::new(symbols, LearnerConfig::default());
+        let mut engine = InterleavedEngine::new(FuturesConfig::default(), learning, 42);
+        let mut candles = make_trending_candles(200, 50000.0, 10.0);
+        candles.swap(100, 50); // timestamps still monotonic per-candle, just reordered in vec
+        let data = vec![("BTCUSDT".to_string(), candles)];
+        let result = engine.run(&data, 60);
+        assert!(result.final_equity > 0.0);
+    }
+
+    #[test]
+    fn test_interleaved_timestamp_monotonic() {
+        // Verify that the engine processes timestamps in monotonic order
+        // by checking that it completes successfully with multi-symbol data
+        let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+        let learning = LearningEngine::new(symbols, LearnerConfig::default());
+        let mut engine = InterleavedEngine::new(FuturesConfig::default(), learning, 42);
+        // Both symbols share same timestamps (15m candles), which should interleave correctly
+        let btc = make_trending_candles(200, 50000.0, 10.0);
+        let eth = make_trending_candles(200, 3000.0, 0.5);
+        let data = vec![
+            ("BTCUSDT".to_string(), btc),
+            ("ETHUSDT".to_string(), eth),
+        ];
+        let result = engine.run(&data, 60);
+        assert!(result.final_equity > 0.0);
+    }
+
+    #[test]
+    fn test_interleaved_empty_data() {
+        let symbols = vec!["BTCUSDT".to_string()];
+        let learning = LearningEngine::new(symbols, LearnerConfig::default());
+        let mut engine = InterleavedEngine::new(FuturesConfig::default(), learning, 42);
+        let data = vec![("BTCUSDT".to_string(), vec![])];
+        let result = engine.run(&data, 60);
+        assert_eq!(result.trades.len(), 0);
     }
 }
