@@ -2,6 +2,41 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Mission
+
+RDEX is a **fully autonomous, self-improving crypto trading system**. The ultimate goal is a system that continuously adapts to evolving market conditions and improves its own profitability without human intervention.
+
+**Everything in this codebase serves one purpose: maximize profits and prevent losses through self-learning.**
+
+The system must:
+1. **Discover** profitable patterns from market data — not be told what they are
+2. **Adapt** when markets change — parameters self-adjust from recent trade outcomes
+3. **Transfer** knowledge across symbols — what works on BTC accelerates learning on alts
+4. **Protect** capital — risk management tightens automatically when performance degrades
+5. **Validate** itself — walk-forward tests and permutation tests reject overfitting
+
+### Autonomous Improvement Loop
+
+When working on this codebase, follow this loop to improve the system:
+
+```
+1. MEASURE  → Run backtest, capture current metrics (return, Sharpe, drawdown, win rate)
+2. DIAGNOSE → Identify weakest metric or biggest loss source (pattern, symbol, exit reason)
+3. IMPROVE  → Enhance the learning mechanism that addresses the weakness:
+              - Weak pattern recognition → richer features, better discretization
+              - Poor entry timing → sharper reward signal, faster Thompson convergence
+              - Large losses → tighter adaptive SL from excursion data
+              - Missed profits → better trailing stop adaptation, longer holds for winners
+              - Slow learning → improved transfer learning, better KNN predictions
+4. VALIDATE → Run backtest again. Metrics must improve. Walk-forward must stay valid.
+5. OVERFIT? → Check for overfitting: walk-forward degradation < 50%? Permutation p < 0.05?
+              Consistent across symbols? Train/test gap reasonable? If ANY check fails → REVERT.
+6. REVERT   → If metrics don't improve OR overfitting detected, undo the change. No exceptions.
+7. REPEAT   → Go to step 1.
+```
+
+**Critical: every improvement must work through the adaptive/learning mechanisms.** Never add hardcoded rules or constants. The system improves by learning better, not by being told what to do.
+
 ## Build & Test Commands
 
 ```bash
@@ -68,6 +103,34 @@ All strategy work **must** focus on two goals: **increase profits** and **preven
 3. **The system discovers what works — you don't tell it.** Thompson Sampling explores pattern→action mappings and reinforces what produces profit. Your job is to give it better inputs and faster feedback, not to prescribe rules.
 4. **Validate every change with backtest metrics.** Run `cargo run -- backtest` and confirm: higher total return, better Sharpe/Sortino, lower max drawdown, or higher profit factor. Walk-forward validation must remain valid. If metrics don't improve, revert.
 
+### CRITICAL: Overfitting Prevention
+
+Overfitting is the #1 threat to this system. A backtest that looks amazing but fails on unseen data is worthless. Every change must be evaluated with overfitting in mind.
+
+**Overfitting red flags — STOP and investigate if you see any of these:**
+- Backtest Sharpe > 5.0 or total return > 100% — suspiciously good, likely curve-fitted
+- Walk-forward test return degrades > 50% from train return — the model memorized, didn't learn
+- Permutation test p-value > 0.05 — trade ordering doesn't matter, edge may be illusory
+- Adding complexity improves in-sample but walk-forward validation fails — textbook overfit
+- A change helps one symbol dramatically but hurts others — fitting noise, not signal
+- Very high win rate (>70%) with few trades — small sample, unreliable
+
+**Mandatory overfitting checks for every change:**
+1. Walk-forward validation must remain valid (majority of folds profitable, low CV, <50% degradation)
+2. Permutation test p-value must stay < 0.05
+3. Results must be consistent across symbols — not just one outlier carrying the portfolio
+4. Compare train vs test performance — large gaps mean overfitting
+5. Prefer simpler changes — more parameters = more overfitting risk
+
+**Design principles that prevent overfitting:**
+- Small pattern space (16 patterns) — each pattern gets enough data to learn reliably
+- Decaying Beta (window ≈ 200 trades) — old evidence fades, preventing stale memorization
+- Adaptive median-split boundaries — bins shift with the market, not fixed to historical data
+- Thompson Sampling exploration — never fully commits, always tests alternatives
+- Transfer learning dampening — sqrt() prevents source convictions from overwhelming targets
+
+**When in doubt, choose the simpler approach.** A robust system that makes 10% reliably beats a fragile one that makes 50% in backtest and loses money live.
+
 ## Tests
 
 All tests are inline `#[cfg(test)]` modules within their source files (~290 tests across 17 modules). Tests use `approx` for float comparisons and `tempfile` for I/O tests.
@@ -78,7 +141,7 @@ Detailed docs in `docs/` (numbered for reading order):
 
 | Doc | Topic | Key content |
 |-----|-------|-------------|
-| [01-overview](docs/01-overview.md) | System overview | Philosophy, two-phase backtest, CLI, data pipeline |
+| [01-overview](docs/01-overview.md) | Mission & overview | Autonomous self-improvement goal, feedback loops, philosophy, CLI |
 | [02-architecture](docs/02-architecture.md) | Architecture | Module map, data flow diagram, responsibility boundaries |
 | [03-thompson-sampling](docs/03-thompson-sampling.md) | Thompson Sampling | DecayingBeta, arm selection, hold bias, reward signal, transfer |
 | [04-adaptive-parameters](docs/04-adaptive-parameters.md) | Adaptive params | All EMA statistics and derived formulas (cooldown, Kelly, trailing) |

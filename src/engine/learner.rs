@@ -314,11 +314,15 @@ impl LearningEngine {
         if has_enough_data && confidence < 0.52 {
             return self.hold_decision();
         }
+        // Scale size by confidence: 0.52 → 1.0x, 0.60 → 1.5x (conservative)
+        let confidence_scale = ((confidence - 0.52) / 0.08).clamp(0.0, 1.0);
+        let scaled_size = size * (1.0 + confidence_scale * 0.5);
+        let scaled_size = scaled_size.clamp(0.05, max_size);
         // Store prediction direction for reward blending
         self.last_prediction = prediction.map(|p| p.directional_prob);
         TradingDecision {
             signal,
-            size,
+            size: scaled_size,
             stop_loss,
             take_profit,
             confidence,
