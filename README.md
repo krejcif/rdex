@@ -31,6 +31,7 @@ graph TD
 
 - **Thompson Sampling** — contextual bandit selects long/short/hold per market pattern, with decaying evidence for non-stationary markets
 - **Adaptive Parameters** — SL/TP, trailing stops, cooldowns, hold limits, and position sizing all derived from EMA statistics of trade outcomes
+- **Signal Flip Guard** — direction reversals blocked during adaptive min_hold period, preventing noisy Thompson samples from causing premature exits
 - **KNN Pattern Library** — temporal feature vectors find similar historical states to predict direction and inform Thompson priors
 - **Cross-Symbol Transfer** — patterns learned on BTC accelerate learning on altcoins through dampened prior transfer
 - **Walk-Forward Validation** — 3-fold out-of-sample testing with Monte Carlo permutation tests to reject overfitting
@@ -43,13 +44,13 @@ graph TD
 cargo build --release
 
 # Fetch 30 days of data for default symbols
-cargo run -- fetch -d 30
+cargo run --bin rdex -- fetch -d 30
 
 # Run backtest with $10,000 starting equity
-cargo run -- backtest -d 30 -e 10000
+cargo run --bin rdex -- backtest -d 30 -e 10000
 
 # Custom symbols and leverage
-cargo run -- backtest -d 60 -e 25000 -l 5 -s BTCUSDT,ETHUSDT,SOLUSDT
+cargo run --bin rdex -- backtest -d 60 -e 25000 -l 5 -s BTCUSDT,ETHUSDT,SOLUSDT
 ```
 
 ### CLI Flags
@@ -149,6 +150,22 @@ graph LR
     Phase 1: Learning --> Phase 2: Exploitation
 ```
 
+## Recent Performance (30-day backtest, $10K, 3x leverage)
+
+| Symbol | Return | Trades | Win Rate | Sharpe | Max DD | PF |
+|--------|--------|--------|----------|--------|--------|-----|
+| BTCUSDT | +13.45% | 88 | 61.4% | 8.00 | 2.61% | 1.90 |
+| ETHUSDT | +25.15% | 91 | 63.7% | 11.48 | 4.34% | 2.56 |
+| SOLUSDT | +38.38% | 94 | 66.0% | 11.85 | 4.56% | 3.70 |
+| BNBUSDT | +33.46% | 97 | 70.1% | 14.52 | 2.52% | 2.94 |
+| XRPUSDT | +36.90% | 93 | 71.0% | 14.29 | 6.92% | 2.50 |
+| DOGEUSDT | +40.86% | 102 | 67.6% | 15.17 | 5.71% | 3.16 |
+| AVAXUSDT | +36.04% | 89 | 66.3% | 13.34 | 4.82% | 2.62 |
+| LINKUSDT | +49.35% | 100 | 69.0% | 12.71 | 5.66% | 3.81 |
+| **Portfolio** | **+34.20%** | **754** | **67.0%** | **12.67** | **6.92%** | — |
+
+Walk-forward valid: 5/8 symbols. Permutation test significant: 1/8 (DOGE p=0.009).
+
 ## Performance Metrics
 
 The backtest produces 30+ metrics including:
@@ -156,11 +173,15 @@ The backtest produces 30+ metrics including:
 | Category | Metrics |
 |----------|---------|
 | Risk/Return | Total return, annualized return, Sharpe, Sortino, Calmar, recovery factor |
-| Drawdown | Max drawdown %, equity curve |
+| Drawdown | Max drawdown %, duration, time underwater, drawdown count |
 | Trade Stats | Win rate, profit factor, expectancy, avg win/loss, best/worst trade |
 | Consistency | Max consecutive wins/losses, trade frequency, avg holding period |
 | Long/Short | Separate win rates, avg P&L, trade counts |
-| Excursion | Avg MAE/MFE per trade |
+| Excursion | Avg MAE/MFE, trade efficiency (capture ratio), losers-that-were-winners |
+| Confidence | Calibration by bucket (low/med/high/vhi) |
+| Sizing | Position size distribution, size-PnL correlation |
+| Fees | Fee impact as % of gross profit, avg fee per trade |
+| Streaks | Win/loss streak averages, maximums, counts |
 
 Each trade record includes: pattern, confidence, Thompson reward, entry ATR, exit reason, MAE/MFE, equity at entry/exit.
 
@@ -204,7 +225,7 @@ Every strategy change must pass:
 
 ## Testing
 
-~290 unit tests across 17 modules:
+290 unit tests across 17 modules:
 
 ```bash
 cargo test --lib              # Run all tests

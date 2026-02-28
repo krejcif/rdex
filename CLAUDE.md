@@ -42,15 +42,15 @@ When working on this codebase, follow this loop to improve the system:
 ## Build & Test Commands
 
 ```bash
-cargo build                          # Debug build
-cargo build --release                # Release build (LTO enabled)
-cargo test --lib                     # Run all unit tests
-cargo test --lib test_name           # Run a single test
-cargo test --lib -- --nocapture      # Tests with stdout output
-cargo clippy                         # Lint
-cargo fmt -- --check                 # Format check
-cargo run -- backtest -d 30 -e 10000 # Run backtest (fetches data from Binance)
-cargo run -- fetch -d 30             # Pre-fetch and cache market data
+cargo build                                    # Debug build
+cargo build --release                          # Release build (LTO enabled)
+cargo test --lib                               # Run all unit tests
+cargo test --lib test_name                     # Run a single test
+cargo test --lib -- --nocapture                # Tests with stdout output
+cargo clippy                                   # Lint
+cargo fmt -- --check                           # Format check
+cargo run --bin rdex -- backtest -d 30 -e 10000 # Run backtest (fetches data from Binance)
+cargo run --bin rdex -- fetch -d 30             # Pre-fetch and cache market data
 ```
 
 ## Architecture
@@ -62,7 +62,7 @@ cargo run -- fetch -d 30             # Pre-fetch and cache market data
 - **`domain/`** — Core types (`Candle`, `Symbol`, `MarketState`, `Position`, `FuturesConfig`), indicator computation (SMA, EMA, RSI, ATR, MACD, Bollinger, ADX). No business logic.
 - **`strategy/`** — Feature extraction (`MarketFeatures`) and pattern discretization. `PatternDiscretizer` uses adaptive median-split binning to produce 16 market patterns (4 features × 2 bins).
 - **`engine/`** — Decision-making core. `LearningEngine` orchestrates Thompson Sampling (`DecayingBeta` arms per symbol/context/strategy). `AdaptiveParams` derives all trading parameters (Kelly sizing, SL/TP, hold limits, cooldowns) from observed trade outcomes. `TradeManager` handles position lifecycle (entry/exit, trailing stops, excursion tracking). `PatternLibrary` provides KNN-based directional probability predictions from temporal feature vectors. `TransferLearning` copies learned arms between symbols when source plateaus.
-- **`backtest/`** — `BacktestEngine` feeds candles sequentially with anti-look-ahead enforcement. `Portfolio` tracks equity with Binance Futures mechanics (leverage, slippage, fees, funding, liquidation). `validation` provides walk-forward cross-validation and Monte Carlo permutation tests.
+- **`backtest/`** — `BacktestEngine` feeds candles sequentially with anti-look-ahead enforcement. Signal flips (direction reversals) are blocked during the adaptive `min_hold` period to prevent noisy Thompson samples from causing premature exits. `Portfolio` tracks equity with Binance Futures mechanics (leverage, slippage, fees, funding, liquidation). `validation` provides walk-forward cross-validation and Monte Carlo permutation tests.
 - **`evaluation/`** — Performance metrics (Sharpe, Sortino, Calmar, max drawdown, profit factor) and reward scoring with adaptive sigmoid.
 - **`data/`** — Async Binance Futures API fetcher with CSV caching.
 
@@ -133,9 +133,22 @@ Overfitting is the #1 threat to this system. A backtest that looks amazing but f
 
 **When in doubt, choose the simpler approach.** A robust system that makes 10% reliably beats a fragile one that makes 50% in backtest and loses money live.
 
+### Known Failed Approaches (Do NOT Retry)
+
+These were tested empirically and degraded performance. Do not attempt them again:
+
+- **Asymmetric reward function** — penalizing losses harder in the sigmoid reward made Thompson too conservative, reducing returns by 26%
+- **Adaptive min_edge threshold** — requiring Thompson action mean to exceed hold mean (or neutral 0.5) by a margin killed all trading. Thompson arm means start at 0.5 during cold start, so any edge threshold blocks exploration entirely. This conflicts with Thompson's stochastic sampling mechanism.
+- **Tighter cold-start excursion defaults** — reducing initial SL from 2.5 to 1.8 ATR caused premature stop-outs, reducing returns by 39%. The wider initial SL is needed to give trades room during cold start.
+- **Per-symbol Thompson Sampling pools** — tested and degraded performance (~230 trades/symbol is too sparse for independent learning)
+- **KNN-Thompson directional agreement filter** — looked great in one run but was fitting noise
+- **KNN-based position sizing blend** — 35% worse than pure Kelly sizing
+- **Pure gradient sizing (no confidence filter)** — 72% return decrease
+- **Confidence-based minimum threshold at 0.505** — increased activity but didn't generalize
+
 ## Tests
 
-All tests are inline `#[cfg(test)]` modules within their source files (~290 tests across 17 modules). Tests use `approx` for float comparisons and `tempfile` for I/O tests.
+All tests are inline `#[cfg(test)]` modules within their source files (290 tests across 17 modules). Tests use `approx` for float comparisons and `tempfile` for I/O tests.
 
 ## Documentation
 
