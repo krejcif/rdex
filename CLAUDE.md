@@ -37,6 +37,8 @@ When working on this codebase, follow this loop to improve the system:
 
 **Critical: every improvement must work through the adaptive/learning mechanisms.** Never add hardcoded rules or constants. The system improves by learning better, not by being told what to do.
 
+**Critical: every change must be checked for overfitting.** No matter what you're modifying — features, indicators, learning logic, risk management, reward signals, even test infrastructure — ask: "Could this make the backtest look better without actually generalizing?" If yes, it's overfitting. See the Overfitting Prevention section below.
+
 ## Build & Test Commands
 
 ```bash
@@ -103,9 +105,9 @@ All strategy work **must** focus on two goals: **increase profits** and **preven
 3. **The system discovers what works — you don't tell it.** Thompson Sampling explores pattern→action mappings and reinforces what produces profit. Your job is to give it better inputs and faster feedback, not to prescribe rules.
 4. **Validate every change with backtest metrics.** Run `cargo run -- backtest` and confirm: higher total return, better Sharpe/Sortino, lower max drawdown, or higher profit factor. Walk-forward validation must remain valid. If metrics don't improve, revert.
 
-### CRITICAL: Overfitting Prevention
+### CRITICAL: Overfitting Prevention — Applies to ALL Development
 
-Overfitting is the #1 threat to this system. A backtest that looks amazing but fails on unseen data is worthless. Every change must be evaluated with overfitting in mind.
+Overfitting is the #1 threat to this system. A backtest that looks amazing but fails on unseen data is worthless. **Every change to any part of the codebase** — features, indicators, patterns, learning, risk management, position sizing, reward signals, transfer logic, backtest mechanics — must be evaluated with overfitting in mind. This is not just a strategy concern; it applies to ALL development work.
 
 **Overfitting red flags — STOP and investigate if you see any of these:**
 - Backtest Sharpe > 5.0 or total return > 100% — suspiciously good, likely curve-fitted

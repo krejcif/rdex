@@ -15,6 +15,7 @@ RDEX is a **fully autonomous, self-improving crypto trading system**. It discove
 5. **Anti-look-ahead enforcement.** The backtest engine asserts at runtime that no future data leaks into decisions. `MarketState` at candle `i` only contains candles `[0..=i]`.
 6. **Cross-domain transfer.** Patterns learned on high-liquidity symbols (BTC) accelerate learning on smaller ones (DOGE, AVAX) through dampened prior transfer.
 7. **Validate everything.** Strategy changes must demonstrate improvement in backtest metrics (return, Sharpe, drawdown). Walk-forward validation and permutation tests guard against overfitting.
+8. **Overfitting prevention in ALL development.** Every change to any part of the codebase — features, indicators, patterns, learning, risk, sizing, rewards, transfer, backtest mechanics — must be checked for overfitting. A beautiful backtest that fails on unseen data is worthless. Prefer simplicity. Check walk-forward degradation, permutation p-values, and cross-symbol consistency before keeping any change.
 
 ## How the System Self-Improves
 

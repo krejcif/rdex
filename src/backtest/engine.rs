@@ -215,7 +215,17 @@ impl BacktestEngine {
             }
 
             // Execute decision
-            self.execute_decision(symbol, &decision, candle, current_atr);
+            // When in a position, only allow signal flips after adaptive min_hold.
+            // This prevents noisy Thompson samples from causing premature exits.
+            // SL still handles risk during min_hold period (checked above).
+            if self.portfolio.has_position() {
+                let min_hold = self.learning.adaptive.min_hold();
+                if self.trades.candles_held >= min_hold {
+                    self.execute_decision(symbol, &decision, candle, current_atr);
+                }
+            } else {
+                self.execute_decision(symbol, &decision, candle, current_atr);
+            }
         }
 
         // Close any remaining position
