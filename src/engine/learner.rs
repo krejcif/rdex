@@ -270,8 +270,18 @@ impl LearningEngine {
         let max_size = self.adaptive.max_position_size();
         let base_size = (kelly * kelly_frac).clamp(0.05, max_size);
 
-        // Pure Kelly sizing — KNN sizing blend tested, adds complexity without clear benefit
-        let size = base_size;
+        // Blend position sizing when KNN prediction exists
+        let size = if let Some(ref pred) = prediction {
+            if pred.avg_max_down > 0.01 {
+                let knn_sizing =
+                    pred.directional_prob * (pred.avg_max_up / pred.avg_max_down) * base_size;
+                (0.6 * knn_sizing + 0.4 * base_size).clamp(0.05, max_size)
+            } else {
+                base_size
+            }
+        } else {
+            base_size
+        };
 
         let price = features.price;
         let atr = features.atr;
@@ -300,19 +310,11 @@ impl LearningEngine {
         };
 
         let confidence = self.thompson.get_arm_mean(pool_key, &pattern, &action.0);
-        // Require minimum confidence to improve win rate — filter low-conviction trades
-        if has_enough_data && confidence < 0.52 {
-            return self.hold_decision();
-        }
-        // Scale size by confidence: 0.52 → 1.0x, 0.60 → 1.5x (conservative)
-        let confidence_scale = ((confidence - 0.52) / 0.08).clamp(0.0, 1.0);
-        let scaled_size = size * (1.0 + confidence_scale * 0.5);
-        let scaled_size = scaled_size.clamp(0.05, max_size);
         // Store prediction direction for reward blending
         self.last_prediction = prediction.map(|p| p.directional_prob);
         TradingDecision {
             signal,
-            size: scaled_size,
+            size,
             stop_loss,
             take_profit,
             confidence,

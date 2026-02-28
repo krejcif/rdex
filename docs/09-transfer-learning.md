@@ -20,15 +20,31 @@ total_regret = Σ regret_i
 
 Compares recent reward window to prior window. If improvement < threshold for consecutive windows:
 
-| Consecutive Plateaus | Action |
-|---------------------|--------|
-| 1 | IncreaseExploration |
-| 2-3 | TriggerTransfer |
-| 4+ | InjectDiversity |
+```mermaid
+graph LR
+    Detect[PlateauDetector] --> P1{1 plateau}
+    P1 --> Explore[IncreaseExploration]
+    Detect --> P2{2-3 plateaus}
+    P2 --> Transfer[TriggerTransfer]
+    Detect --> P3{4+ plateaus}
+    P3 --> Diversity[InjectDiversity]
+```
 
 Window size: 5, threshold: 0.005 (from `LearnerConfig`).
 
 ## Transfer Process
+
+```mermaid
+graph TD
+    Start[maybe_transfer after each symbol] --> Rank[Rank symbols by evidence<br/>total observations]
+    Rank --> Source[Source = most evidence<br/>must exceed 150 obs]
+    Source --> Loop["For each target with<br/>< half source evidence"]
+    Loop --> Check{Plateau detected<br/>OR < 50 obs?}
+    Check -->|Yes| Extract["Extract significant priors<br/>(evidence > 10)"]
+    Check -->|No| Skip[Skip target]
+    Extract --> Dampen["Dampen:<br/>α' = 1 + √(α - 1)<br/>β' = 1 + √(β - 1)"]
+    Dampen --> Insert["Insert into target<br/>(only if slot empty)"]
+```
 
 `LearningEngine::maybe_transfer()` runs after each symbol's training:
 

@@ -13,21 +13,20 @@
 
 ## Per-Candle Loop
 
-```
-for i in warmup..candles.len():
-    assert(i >= max_seen_index)              # anti-look-ahead
-    max_seen_index = i
-
-    1. learning.adaptive.tick_candle()        # age-based tracking
-    2. portfolio.update_mark(close)           # mark-to-market
-    3. apply_funding_fee(candle)              # if position open + funding event in range
-    4. check_liquidation()                    # close if margin exceeded
-    5. trades.check_sl_tp()                   # SL/TP (respects min_hold)
-    6. trades.on_candle()                     # excursion tracking, trailing, max_hold exit
-    7. trades.tick_cooldown()                 # skip if in cooldown
-    8. build_market_state()                   # from ONLY past data
-    9. learning.decide()                      # features → pattern → Thompson → action
-   10. execute_decision()                     # open/close/flip position
+```mermaid
+graph TD
+    Start["for i in warmup..candles.len()"] --> Assert["assert(i >= max_seen_index)<br/>max_seen_index = i"]
+    Assert --> Tick[1. adaptive.tick_candle]
+    Tick --> Mark[2. portfolio.update_mark]
+    Mark --> Fund[3. apply_funding_fee]
+    Fund --> Liq[4. check_liquidation]
+    Liq --> SL[5. trades.check_sl_tp<br/>respects min_hold]
+    SL --> Candle[6. trades.on_candle<br/>excursion, trailing, max_hold]
+    Candle --> Cool[7. trades.tick_cooldown]
+    Cool --> Build[8. build_market_state<br/>from ONLY past data]
+    Build --> Decide[9. learning.decide<br/>features → pattern → Thompson → action]
+    Decide --> Exec[10. execute_decision<br/>open/close/flip position]
+    Exec --> Start
 ```
 
 ## Funding Fee Handling
@@ -40,22 +39,23 @@ Binance Futures funding occurs every 8 hours (00:00, 08:00, 16:00 UTC). The engi
 
 ## Position Lifecycle
 
-```
-Signal received (Long/Short)
-    │
-    ├─ If opposite position open → close it first (signal_flip)
-    ├─ Portfolio.open_position() with slippage (fee deferred to close)
-    └─ TradeManager.on_entry() captures SL/TP, ATR, pattern, equity
+```mermaid
+graph TD
+    Signal["Signal received<br/>(Long/Short)"] --> Flip{Opposite<br/>position open?}
+    Flip -->|Yes| Close1[Close existing position]
+    Flip -->|No| Open
+    Close1 --> Open[Portfolio.open_position<br/>with slippage]
+    Open --> Entry[TradeManager.on_entry<br/>captures SL/TP, ATR, pattern, equity]
 
-Each candle while open:
-    ├─ TradeManager.on_candle() tracks excursions, updates trailing stop
-    ├─ TradeManager.check_sl_tp() fires after min_hold
-    └─ Max hold exit with 2x normal cooldown
+    Entry --> Loop["Each candle while open"]
+    Loop --> Excursion[on_candle: track excursions,<br/>update trailing stop]
+    Excursion --> CheckSL[check_sl_tp<br/>fires after min_hold]
+    CheckSL --> MaxHold[Max hold exit<br/>2x normal cooldown]
 
-Position closes:
-    ├─ Portfolio.close_position() calculates net P&L (slippage + entry fee + exit fee + funding)
-    ├─ TradeManager.on_exit() records outcome → Thompson + AdaptiveParams + ExcursionTracker
-    └─ TradeManager.reset() sets cooldown from adaptive params
+    MaxHold --> ClosePos[Position closes]
+    ClosePos --> PnL["Portfolio.close_position<br/>net P&L (slippage + fees + funding)"]
+    PnL --> Record["TradeManager.on_exit<br/>→ Thompson + AdaptiveParams + ExcursionTracker"]
+    Record --> Cooldown[TradeManager.reset<br/>sets cooldown from adaptive params]
 ```
 
 ## Results Output

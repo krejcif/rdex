@@ -26,13 +26,15 @@ Three-level nested HashMap: `symbol → MarketContext → StrategyId → Decayin
 
 ## Arm Selection
 
-```
-For each action in [long, short, hold]:
-    sample = Beta(alpha, beta).sample()
-    bonus  = exploration_coeff * sqrt(ln(total_decisions) / visits)
-    score  = sample + bonus
-
-Select action with highest score.
+```mermaid
+graph TD
+    A[For each action:<br/>long, short, hold] --> B["sample = Beta(alpha, beta).sample()"]
+    B --> C["bonus = exploration × √(ln(total_decisions) / visits)"]
+    C --> D["score = sample + bonus"]
+    D --> E{Highest score?}
+    E -->|long| F[Go Long]
+    E -->|short| G[Go Short]
+    E -->|hold| H[Hold]
 ```
 
 The curiosity bonus is UCB-like and decays as each arm accumulates visits.
@@ -51,8 +53,11 @@ This creates a conservative bias early on that naturally decays as the engine ga
 
 Trade P&L is converted to `[0, 1]` via adaptive sigmoid:
 
-```
-reward = 1 / (1 + exp(-k * pnl_pct))
+```mermaid
+graph LR
+    PnL[Trade P&L %] --> Sigmoid["reward = 1 / (1 + exp(-k × pnl_pct))"]
+    Sigmoid --> Reward["[0, 1] reward"]
+    K["k = 1 / pnl_std<br/>(from AdaptiveParams)"] --> Sigmoid
 ```
 
 Where `k = 1 / pnl_std` (adaptive, from `AdaptiveParams`). Small trades → steep sigmoid. Large trades → gentle gradient.
@@ -61,8 +66,11 @@ Where `k = 1 / pnl_std` (adaptive, from `AdaptiveParams`). Small trades → stee
 
 When a source symbol has accumulated enough evidence (>10 effective observations per arm):
 
-1. Extract priors: `HashMap<MarketContext, HashMap<StrategyId, BetaParams>>`
-2. Dampen: `alpha' = 1 + sqrt(alpha - 1)`, same for beta
-3. Seed into target symbol (only if target doesn't already have that arm)
+```mermaid
+graph LR
+    Source[Source symbol<br/>rich evidence] -->|Extract priors| Priors["HashMap<Context,<br/>HashMap<Strategy, Beta>>"]
+    Priors -->|Dampen| Dampened["α' = 1 + √(α - 1)<br/>β' = 1 + √(β - 1)"]
+    Dampened -->|Seed empty slots| Target[Target symbol<br/>sparse evidence]
+```
 
 Dampening prevents source symbol's strong convictions from overwhelming the target's local learning.

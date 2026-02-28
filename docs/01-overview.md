@@ -20,6 +20,24 @@ RDEX is a **fully autonomous, self-improving crypto trading system**. It discove
 
 The system has multiple feedback loops that drive autonomous improvement:
 
+```mermaid
+graph TD
+    Trade[Trade Outcome] --> TS[Thompson Sampling<br/>Re-weight pattern→action]
+    Trade --> AP[AdaptiveParams<br/>Update EMA statistics]
+    Trade --> ET[ExcursionTracker<br/>Update MAE/MFE per pattern]
+
+    AP -->|SL/TP, sizing, cooldown| Next[Next Trade Decision]
+    ET -->|Adaptive stops| Next
+    TS -->|Action selection| Next
+
+    TS --> PD[PlateauDetector<br/>Stalled learning?]
+    PD -->|Yes| TL[Transfer Learning<br/>Copy dampened priors]
+    TL --> TS
+
+    KNN[KNN PatternLibrary<br/>Find similar states] -->|Directional prob| TS
+    DB[Decaying Beta<br/>Old evidence fades] -->|Window ≈ 200 trades| TS
+```
+
 | Loop | Mechanism | Adapts to |
 |------|-----------|-----------|
 | **Thompson Sampling** | Rewards winning pattern→action pairs, decays losers | Which trades work in which conditions |
@@ -32,16 +50,21 @@ The system has multiple feedback loops that drive autonomous improvement:
 
 ## Two-Phase Backtest
 
-```
-Phase 1: Sequential Learning
-  One shared LearningEngine processes symbols in order.
-  BTC → ETH → SOL → BNB → XRP → DOGE → AVAX → LINK
-  Each symbol's patterns accumulate into the shared Thompson engine.
+```mermaid
+graph LR
+    subgraph Phase1[Phase 1: Sequential Learning]
+        BTC --> ETH --> SOL --> BNB --> XRP --> DOGE --> AVAX --> LINK
+    end
 
-Phase 2: Exploitation
-  Re-run all symbols with the fully trained engine.
-  Walk-forward validation (3 folds) + Monte Carlo permutation tests.
+    subgraph Phase2[Phase 2: Exploitation]
+        Rerun[Re-run all with trained engine] --> WF[Walk-Forward 3 folds]
+        WF --> MC[Monte Carlo permutation]
+    end
+
+    Phase1 --> Phase2
 ```
+
+One shared `LearningEngine` processes symbols in order. Each symbol's patterns accumulate into the shared Thompson engine. Phase 2 re-runs all symbols with the fully trained engine, then validates.
 
 ## CLI
 
@@ -59,10 +82,8 @@ rdex fetch -d 30 -s BTCUSDT,ETHUSDT
 
 ## Data Pipeline
 
-```
-Binance FAPI (public, no key) → 15m OHLCV + funding rates (8h)
-                                      ↓
-                              CSV cache in data/ (1h TTL)
-                                      ↓
-                              BacktestEngine sequential processing
+```mermaid
+graph TD
+    A[Binance FAPI<br/>public, no key] -->|15m OHLCV + 8h funding rates| B[CSV Cache<br/>data/ directory, 1h TTL]
+    B --> C[BacktestEngine<br/>sequential processing]
 ```

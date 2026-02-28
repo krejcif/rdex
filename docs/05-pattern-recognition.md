@@ -18,10 +18,12 @@ Plus raw `atr` and `price` for SL/TP and sizing calculations.
 
 ## Adaptive Median-Split Binning
 
-The `PatternDiscretizer` uses 4 key features (trend, momentum, volatility, volume) and bins each into 0 or 1 based on a running median:
-
-```
-4 features × 2 bins = 16 possible patterns
+```mermaid
+graph TD
+    Features["4 key features:<br/>trend, momentum, volatility, volume"] --> Binners["4 MedianBinners<br/>(adaptive running median)"]
+    Binners --> Bins["Each feature → 0 or 1<br/>(below/above median)"]
+    Bins --> Pattern["4 bits = 16 possible patterns<br/>e.g. '01_10'"]
+    Pattern --> Context["MarketContext<br/>volatility_tier + trend_regime"]
 ```
 
 ### Why 16 patterns?
@@ -43,6 +45,22 @@ Example: `"01_10"` means trend=low, momentum=high, volatility=high, volume=low.
 Pattern key for lookups: `"01_10"` (joined with underscore).
 
 ## Excursion Tracking
+
+```mermaid
+graph TD
+    Trade[Trade closes] --> Check{Winner?}
+    Check -->|Yes| Fav["Update ema_favorable<br/>(max run in trade direction, ATR)"]
+    Check -->|No| Skip[Skip favorable update]
+    Trade --> Adv["Update ema_adverse<br/>(max run against trade, ATR)"]
+
+    Fav --> SL["Adaptive TP<br/>from favorable excursion"]
+    Adv --> TP["Adaptive SL<br/>from adverse excursion"]
+
+    SL --> Fallback{Per-pattern<br/>per-side data?}
+    TP --> Fallback
+    Fallback -->|Yes| Specific[Use side-specific stats]
+    Fallback -->|No| General[Fallback to pattern-only stats]
+```
 
 `ExcursionTracker` maintains per-pattern, per-side decaying statistics of:
 - **Favorable excursion:** Maximum run in the trade's direction (ATR multiples) for winning trades

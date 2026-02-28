@@ -45,60 +45,23 @@ src/
 
 ## Data Flow
 
-```
-                    Candle[i] (just closed)
-                           │
-                    build_market_state()
-                           │
-                    ┌──────┴──────┐
-                    │ MarketState │  (history[0..=i], indicators)
-                    └──────┬──────┘
-                           │
-                MarketFeatures::extract()
-                           │
-              ┌────────────┴────────────┐
-              │  trend, momentum,       │
-              │  volatility, volume,    │
-              │  candle_char, bb_pos,   │
-              │  short_momentum         │
-              └────────────┬────────────┘
-                           │
-              PatternDiscretizer.discretize()
-                           │
-                ┌──────────┴──────────┐
-                │  MarketContext       │  (one of 16 patterns)
-                │  "01_10"            │
-                └──────────┬──────────┘
-                           │
-              ThompsonEngine.select_arm()
-                           │
-              ┌────────────┴────────────┐
-              │  Action: long/short/hold │
-              └────────────┬────────────┘
-                           │
-              ┌────────────┴────────────┐
-              │  Kelly sizing           │
-              │  Excursion-based SL     │
-              │  Adaptive exploration   │
-              └────────────┬────────────┘
-                           │
-                   TradingDecision
-                           │
-                    ┌──────┴──────┐
-                    │  Portfolio  │──→ Open/close position
-                    └──────┬──────┘
-                           │
-                    TradeManager
-                    (trailing stop, breakeven,
-                     excursion tracking, max hold)
-                           │
-                    Trade closes
-                           │
-              ┌────────────┴────────────┐
-              │  AdaptiveParams.record  │  Updates all EMAs
-              │  Thompson.record        │  Updates Beta distribution
-              │  ExcursionTracker       │  Updates SL/TP targets
-              └─────────────────────────┘
+```mermaid
+graph TD
+    A["Candle[i] just closed"] --> B[build_market_state]
+    B --> C["MarketState<br/>(history[0..=i], indicators)"]
+    C --> D[MarketFeatures::extract]
+    D --> E["7 features:<br/>trend, momentum, volatility,<br/>volume, candle_char, bb_pos,<br/>short_momentum"]
+    E --> F[PatternDiscretizer.discretize]
+    F --> G["MarketContext<br/>(1 of 16 patterns)"]
+    G --> H[ThompsonEngine.select_arm]
+    H --> I["Action: long / short / hold"]
+    I --> J["Kelly sizing<br/>Excursion-based SL<br/>Adaptive exploration"]
+    J --> K[TradingDecision]
+    K --> L[Portfolio<br/>Open/close position]
+    L --> M["TradeManager<br/>(trailing stop, breakeven,<br/>excursion tracking, max hold)"]
+    M --> N[Trade closes]
+    N --> O["AdaptiveParams.record → update EMAs<br/>Thompson.record → update Beta<br/>ExcursionTracker → update SL/TP"]
+    O -->|feedback| H
 ```
 
 ## Key Responsibility Boundaries
