@@ -270,18 +270,8 @@ impl LearningEngine {
         let max_size = self.adaptive.max_position_size();
         let base_size = (kelly * kelly_frac).clamp(0.05, max_size);
 
-        // Blend position sizing when KNN prediction exists
-        let size = if let Some(ref pred) = prediction {
-            if pred.avg_max_down > 0.01 {
-                let knn_sizing =
-                    pred.directional_prob * (pred.avg_max_up / pred.avg_max_down) * base_size;
-                (0.6 * knn_sizing + 0.4 * base_size).clamp(0.05, max_size)
-            } else {
-                base_size
-            }
-        } else {
-            base_size
-        };
+        // Pure Kelly sizing — KNN sizing blend tested, adds complexity without clear benefit
+        let size = base_size;
 
         let price = features.price;
         let atr = features.atr;
